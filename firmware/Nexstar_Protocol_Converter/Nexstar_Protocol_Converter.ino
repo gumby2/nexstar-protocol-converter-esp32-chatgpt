@@ -469,59 +469,6 @@ void startFallbackAP();
 // Full WiFi log lines are mirrored to serial by addLogLine().
 // Use LOG_* / LOG_*_CAT macros for formatted serial-visible logging.
 
-void logPrintfCat(int level, uint16_t cat, const char* fmt, ...) {
-  if (LOG_LEVEL < level) return;
-  if ((LOG_SUBSYSTEM_MASK & cat) == 0) return;
-
-  char msg[220];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, args);
-  va_end(args);
-
-  String line;
-  line.reserve(260);
-  line += "[";
-  line += logLevelName(level);
-  line += "][";
-  line += logCategoryName(cat);
-  line += "] ";
-  line += msg;
-  if (level <= LOG_WARN && level > LOG_NONE) {
-    logAlertActive = true;
-    logAlertText = line;
-    logAlertMs = millis();
-  }
-  addLogLine(line);
-}
-
-// Default legacy logs go to the system bucket.
-// Critical existing logs still appear unless system is unchecked.
-void logPrintf(int level, const char* tag, const char* fmt, ...) {
-  if (LOG_LEVEL < level) return;
-  if ((LOG_SUBSYSTEM_MASK & LOG_CAT_SYSTEM) == 0) return;
-
-  char msg[220];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, args);
-  va_end(args);
-
-  String line;
-  line.reserve(260);
-  line += "[";
-  line += logLevelName(level);
-  line += "][system] ";
-  line += msg;
-  if (level <= LOG_WARN && level > LOG_NONE) {
-    logAlertActive = true;
-    logAlertText = line;
-    logAlertMs = millis();
-  }
-  addLogLine(line);
-}
-
-
 void computeAltAzFromRaDec();
 void computeRaDecFromAltAz();
 
