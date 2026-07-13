@@ -6,3 +6,5 @@ dist/
 *.zip
 arduino-cli
 *.tar.gz
+
+firmware/Nexstar_Protocol_Converter/build/
