@@ -100,7 +100,7 @@ const char* FW_NAME = "NexStar Protocol Converter";
 const bool WEB_STARTUP_READ_MOUNT = false;
 const unsigned long WEB_STATUS_REFRESH_MS = 8000;
 const unsigned long WEB_LOG_REFRESH_MS = 5000;
-const bool SERIAL_MIRROR_FULL_WIFI_LOGS = true; // mirror the same formatted Full WiFi log lines to USB serial
+extern const bool SERIAL_MIRROR_FULL_WIFI_LOGS = true; // mirror the same formatted Full WiFi log lines to USB serial
 
 
 const uint16_t HTTP_WEB_PORT = 80;
@@ -468,38 +468,6 @@ void startFallbackAP();
 
 // Full WiFi log lines are mirrored to serial by addLogLine().
 // Use LOG_* / LOG_*_CAT macros for formatted serial-visible logging.
-
-void addLogLine(const String &line) {
-  String stamped = line;
-  if (!logLineAlreadyTimestamped(stamped)) {
-    stamped = shortLogTimestamp() + " " + stamped;
-  }
-
-  logBuffer[logWriteIndex] = stamped;
-  logWriteIndex++;
-  if (logWriteIndex >= LOG_BUFFER_LINES) {
-    logWriteIndex = 0;
-    logWrapped = true;
-  }
-
-#if defined(ESP32) || defined(ESP8266)
-  if (SERIAL_MIRROR_FULL_WIFI_LOGS) {
-    Serial.println(stamped);
-  }
-#endif
-
-#if defined(ESP32)
-  // Live Telnet log mirror. The log level/category filters are already applied
-  // before addLogLine() is called, so Telnet sees the same filtered stream as
-  // the COM-port console. Use CRLF so Telnet clients do not stair-step lines.
-  if (telnetLiveLogEnabled && telnetAuthenticated && telnetClient && telnetClient.connected()) {
-    telnetClient.print("\r\n");
-    telnetClient.print(stamped);
-    telnetClient.print("\r\n> ");
-    telnetLiveLogLines++;
-  }
-#endif
-}
 
 void logPrintfCat(int level, uint16_t cat, const char* fmt, ...) {
   if (LOG_LEVEL < level) return;

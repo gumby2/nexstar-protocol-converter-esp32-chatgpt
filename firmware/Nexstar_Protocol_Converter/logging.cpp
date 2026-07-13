@@ -1,4 +1,18 @@
 #include "logging.h"
+#if defined(ESP32)
+  #include <WiFi.h>
+#endif
+
+#if defined(ESP32) || defined(ESP8266)
+extern const bool SERIAL_MIRROR_FULL_WIFI_LOGS;
+#endif
+
+#if defined(ESP32)
+extern WiFiClient telnetClient;
+extern bool telnetAuthenticated;
+extern bool telnetLiveLogEnabled;
+extern uint32_t telnetLiveLogLines;
+#endif
 
 int LOG_LEVEL = LOG_WARN;
 uint16_t LOG_SUBSYSTEM_MASK = LOG_CAT_ALL;
@@ -54,4 +68,36 @@ bool logLineAlreadyTimestamped(const String &line) {
          line.charAt(3) == ':' &&
          line.charAt(6) == ':' &&
          line.charAt(9) == ']';
+}
+
+void addLogLine(const String &line) {
+  String stamped = line;
+  if (!logLineAlreadyTimestamped(stamped)) {
+    stamped = shortLogTimestamp() + " " + stamped;
+  }
+
+  logBuffer[logWriteIndex] = stamped;
+  logWriteIndex++;
+  if (logWriteIndex >= LOG_BUFFER_LINES) {
+    logWriteIndex = 0;
+    logWrapped = true;
+  }
+
+#if defined(ESP32) || defined(ESP8266)
+  if (SERIAL_MIRROR_FULL_WIFI_LOGS) {
+    Serial.println(stamped);
+  }
+#endif
+
+#if defined(ESP32)
+  // Live Telnet log mirror. The log level/category filters are already applied
+  // before addLogLine() is called, so Telnet sees the same filtered stream as
+  // the COM-port console. Use CRLF so Telnet clients do not stair-step lines.
+  if (telnetLiveLogEnabled && telnetAuthenticated && telnetClient && telnetClient.connected()) {
+    telnetClient.print("\r\n");
+    telnetClient.print(stamped);
+    telnetClient.print("\r\n> ");
+    telnetLiveLogLines++;
+  }
+#endif
 }
