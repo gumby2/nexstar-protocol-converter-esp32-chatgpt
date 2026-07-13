@@ -1,0 +1,8 @@
+.build/
+dist/
+*.bin
+*.elf
+*.map
+*.zip
+arduino-cli
+*.tar.gz

@@ -1,0 +1,12 @@
+name: Browser Static Checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  browser-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify required UI symbols and removed preset
+        run: python3 tools/browser-test/static_check.py
