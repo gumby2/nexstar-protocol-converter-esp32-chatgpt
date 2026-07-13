@@ -1,5 +1,6 @@
-﻿#include <Arduino.h>
+#include <Arduino.h>
 #include "logging.h"
+#include "mount_transport.h"
 #include "settings.h"
 #include <math.h>
 #include <stddef.h>
@@ -17,7 +18,6 @@
   #include <ESP8266HTTPClient.h>
   #include <ESP8266WebServer.h>
   #include <WiFiUdp.h>
-  #include <SoftwareSerial.h>
 #else
   #include <WiFi.h>
   #include <HTTPClient.h>
@@ -43,23 +43,6 @@
   #define HAS_CLASSIC_BT ENABLE_CLASSIC_BT
 #else
   #define HAS_CLASSIC_BT 0
-#endif
-
-#if defined(ESP8266)
-  #define MOUNT_RX_PIN D5
-  #define MOUNT_TX_PIN D7
-  SoftwareSerial MountSerial(MOUNT_RX_PIN, MOUNT_TX_PIN);
-  #define BOARD_NAME "ESP8266 ESP-12E / D1 mini style"
-#elif defined(CONFIG_IDF_TARGET_ESP32S2)
-  #define MOUNT_RX_PIN 16
-  #define MOUNT_TX_PIN 17
-  HardwareSerial MountSerial(1);
-  #define BOARD_NAME "ESP32-S2"
-#else
-  #define MOUNT_RX_PIN 16
-  #define MOUNT_TX_PIN 17
-  HardwareSerial MountSerial(2);
-  #define BOARD_NAME "Regular ESP32"
 #endif
 
 // Optional hardware startup-mode override pins.
@@ -224,16 +207,6 @@ bool ntpSyncValid = false;
 BluetoothSerial SerialBT;
 #endif
 
-const unsigned long MOUNT_BAUD = 9600;
-const unsigned long HANDSHAKE_TIMEOUT_MS = 3000;
-const unsigned long READ_TIMEOUT_MS = 3000;
-const unsigned long GOTO_TIMEOUT_MS = 180000;
-
-const unsigned long COOLDOWN_MS = 100;
-const unsigned long AFTER_HANDSHAKE_TX_DELAY_MS = 50;
-const unsigned long AFTER_COMMAND_TX_DELAY_MS = 50;
-const unsigned long BEFORE_PAYLOAD_DELAY_MS = 100;
-
 unsigned long lastMountPollMs = 0;
 unsigned long lastComputedCoordMs = 0;
 unsigned long lastPositionDemandMs = 0;
@@ -247,7 +220,6 @@ enum LX200Source {
 const char* currentWebRequestPath = "";
 
 
-bool mountBusy = false;
 bool alpacaConnected = true;
 uint32_t alpacaHttpRequests = 0;
 bool asyncSlewPending = false;
@@ -311,16 +283,10 @@ const unsigned long SKYSAFARI_BT_TRAFFIC_GUARD_MS = 250;
 const unsigned long SKYSAFARI_BT_COMMAND_POLL_QUIET_MS = 1500;
 const size_t LX200_MAX_CMD_LEN = 96;
 
-unsigned long lastMountResponseMs = 0;
-unsigned long lastMountFaultMs = 0;
 unsigned long lx200BtLastCommandHandledMs = 0;
-bool mountCommFault = false;
-String lastMountFault = "No mount communication yet";
 bool lastGotoCommandAccepted = false;
-uint8_t backgroundPollFailCount = 0;
 const uint8_t BACKGROUND_POLL_FAIL_LIMIT = 3;
 bool backgroundPollingAutoDisabled = false;
-bool suppressNextMountFault = false;
 unsigned long lastLoopTimeMs = 0;
 unsigned long maxLoopTimeMs = 0;
 unsigned long lastLoopLatencyMs = 0;
@@ -423,49 +389,6 @@ void startFallbackAP();
 void computeAltAzFromRaDec();
 void computeRaDecFromAltAz();
 
-
-
-void markMountResponse() {
-  lastMountResponseMs = millis();
-  mountCommFault = false;
-  lastMountFault = "";
-  backgroundPollFailCount = 0;
-}
-
-void markMountFault(const String &reason) {
-  lastMountFaultMs = millis();
-  lastMountFault = reason;
-
-  if (suppressNextMountFault) {
-    LOGD("Suppressed transient mount fault: %s", reason.c_str());
-    suppressNextMountFault = false;
-    return;
-  }
-
-  mountCommFault = true;
-}
-
-bool mountAlive() {
-  return lastMountResponseMs > 0 && !mountCommFault;
-}
-
-unsigned long mountLastResponseAge() {
-  if (lastMountResponseMs == 0) return 0;
-  return millis() - lastMountResponseMs;
-}
-
-bool isPrintableByte(uint8_t b) {
-  return b >= 32 && b <= 126;
-}
-
-void safeDelay(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    delay(1);
-    yield();
-  }
-}
-
 double degToRad(double d) { return d * PI / 180.0; }
 double radToDeg(double r) { return r * 180.0 / PI; }
 
@@ -519,25 +442,6 @@ double rateToNudgeStep(double rate) {
   return nudgeRateDeg[3];
 }
 
-void printRxByte(uint8_t b) {
-  LOG_MOUNT_T("RX MOUNT 0x%02X '%c'", b, isPrintableByte(b) ? b : '.');
-}
-
-void printTxByte(uint8_t b) {
-  LOG_MOUNT_T("TX MOUNT 0x%02X '%c'", b, isPrintableByte(b) ? b : '.');
-}
-
-void mountWriteByte(uint8_t b) {
-  printTxByte(b);
-  MountSerial.write(b);
-  MountSerial.flush();
-}
-
-void mountWriteBE16(int16_t value) {
-  mountWriteByte((uint8_t)((value >> 8) & 0xFF));
-  mountWriteByte((uint8_t)(value & 0xFF));
-}
-
 void serviceHttpServers() {
   if (bridgeMode != BRIDGE_MODE_WIFI_FULL) return;
 
@@ -578,128 +482,6 @@ void serviceNetworkDuringMountWait() {
   serviceNtpSync();
   delay(1);
   yield();
-}
-
-bool mountReadByte(uint8_t &b, unsigned long timeoutMs) {
-  unsigned long start = millis();
-
-  while (millis() - start < timeoutMs) {
-    if (MountSerial.available()) {
-      b = MountSerial.read();
-      printRxByte(b);
-      markMountResponse();
-      return true;
-    }
-
-    serviceNetworkDuringMountWait();
-  }
-
-  String reason = "mountReadByte timeout after " + String(timeoutMs) + " ms";
-  LOGW("%s", reason.c_str());
-  markMountFault(reason);
-  return false;
-}
-
-
-bool mountReadByteQuiet(uint8_t &b, unsigned long timeoutMs) {
-  unsigned long start = millis();
-
-  while (millis() - start < timeoutMs) {
-    if (MountSerial.available()) {
-      b = MountSerial.read();
-      printRxByte(b);
-      markMountResponse();
-      return true;
-    }
-
-    serviceNetworkDuringMountWait();
-  }
-
-  return false;
-}
-
-bool mountReadExact(uint8_t* buf, size_t len, unsigned long timeoutMs) {
-  size_t got = 0;
-  unsigned long start = millis();
-
-  while (got < len && millis() - start < timeoutMs) {
-    if (MountSerial.available()) {
-      uint8_t b = MountSerial.read();
-      buf[got++] = b;
-      printRxByte(b);
-      markMountResponse();
-      start = millis();
-    } else {
-      serviceNetworkDuringMountWait();
-    }
-  }
-
-  if (got != len) {
-    String reason = "mountReadExact timeout: expected " + String((unsigned)len) + " got " + String((unsigned)got);
-    LOG_MOUNT_W("%s", reason.c_str());
-    markMountFault(reason);
-    return false;
-  }
-
-  return true;
-}
-
-void drainMount() {
-  int count = 0;
-  while (MountSerial.available()) {
-    uint8_t b = MountSerial.read();
-    LOG_MOUNT_I("[DRAIN] 0x%02X '%c'", b, isPrintableByte(b) ? b : '.');
-    markMountResponse();
-    count++;
-  }
-  LOG_MOUNT_I("Drained %d byte(s)", count);
-}
-
-bool beginMountCommand(const char* name) {
-  if (mountBusy) {
-    LOG_MOUNT_D("Blocked mount command '%s': mountBusy=true", name);
-    return false;
-  }
-
-  mountBusy = true;
-  LOG_MOUNT_D("Begin mount command: %s", name);
-  return true;
-}
-
-void endMountCommand(const char* name) {
-  LOG_MOUNT_D("End mount command: %s", name);
-  mountBusy = false;
-}
-
-bool nexstarHandshakeLocked(const char* name) {
-  safeDelay(COOLDOWN_MS);
-
-  LOG_MOUNT_D("%s: sending handshake '?'", name);
-  mountWriteByte('?');
-
-  safeDelay(AFTER_HANDSHAKE_TX_DELAY_MS);
-
-  uint8_t resp = 0;
-  if (!mountReadByte(resp, HANDSHAKE_TIMEOUT_MS)) {
-    String reason = String(name) + ": handshake failed, no '#'";
-    if (suppressNextMountFault) LOGW("%s", reason.c_str());
-    else LOGE("%s", reason.c_str());
-    markMountFault(reason);
-    return false;
-  }
-
-  if (resp != '#') {
-    String reason = String(name) + ": handshake failed, expected '#', got 0x" + String(resp, HEX);
-    if (suppressNextMountFault) LOGW("%s", reason.c_str());
-    else LOGE("%s", reason.c_str());
-    markMountFault(reason);
-    return false;
-  }
-
-  LOG_MOUNT_D("%s: handshake OK", name);
-  markMountResponse();
-  safeDelay(COOLDOWN_MS);
-  return true;
 }
 
 void computeAltAzFromRaDec();
@@ -961,42 +743,6 @@ bool gotoAltAz(double alt, double az) {
   asyncSlewRunning = false;
   endMountCommand(name);
   return ok;
-}
-
-
-bool waitForNexStarCompletion(const char* name, unsigned long timeoutMs) {
-  unsigned long start = millis();
-  LOG_MOUNT_D("%s: waiting for NexStar completion '@'", name);
-
-  while (millis() - start < timeoutMs) {
-    uint8_t b = 0;
-    if (mountReadByteQuiet(b, 250)) {
-      if (b == '@') {
-        LOG_MOUNT_I("%s: completion '@' received", name);
-        markMountResponse();
-        return true;
-      }
-      LOG_MOUNT_W("%s: ignored byte while waiting for '@': 0x%02X '%c'",
-                  name, b, isPrintableByte(b) ? b : '.');
-    }
-
-#if HAS_CLASSIC_BT
-    // Keep the Bluetooth stack alive, but do not process new SkySafari commands
-    // while the original NexStar mount is completing this single-command move.
-    if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
-      delay(1);
-      yield();
-    } else
-#endif
-    {
-      serviceNetworkDuringMountWait();
-    }
-  }
-
-  String reason = String(name) + ": timed out waiting for completion '@'";
-  LOG_MOUNT_W("%s", reason.c_str());
-  markMountFault(reason);
-  return false;
 }
 
 
@@ -5785,8 +5531,8 @@ void handleMountTestPage() {
   s += "Test: send '?' and wait for '#'\n\n";
 
   int drained = 0;
-  while (MountSerial.available()) {
-    int d = MountSerial.read();
+  while (mountRawAvailable()) {
+    int d = mountReadRawByte();
     drained++;
     s += "Drained before test: 0x" + String(d, HEX);
     if (d >= 32 && d <= 126) {
@@ -5799,14 +5545,14 @@ void handleMountTestPage() {
   if (drained == 0) s += "No pre-existing serial bytes to drain.\n";
 
   Serial.println("[MOUNT_TEST] sending '?' handshake on UART2");
-  MountSerial.write((uint8_t)'?');
-  MountSerial.flush();
+  mountWriteRawByte((uint8_t)'?');
+  mountFlush();
 
   unsigned long start = millis();
   int got = -1;
   while (millis() - start < 1500) {
-    if (MountSerial.available()) {
-      got = MountSerial.read();
+    if (mountRawAvailable()) {
+      got = mountReadRawByte();
       break;
     }
     delay(1);
@@ -8519,8 +8265,8 @@ void serviceGotoCompletionWatch() {
   unsigned long nowMs = millis();
 
   if (gotoCompletionWatchActive) {
-    while (MountSerial.available()) {
-      uint8_t b = (uint8_t)MountSerial.read();
+    while (mountRawAvailable()) {
+      uint8_t b = (uint8_t)mountReadRawByte();
       printRxByte(b);
       markMountResponse();
 
@@ -9032,11 +8778,7 @@ delay(500);
   Serial.printf("Board: %s\n", BOARD_NAME);
   Serial.printf("Mount serial RX=%d TX=%d baud=%lu\n", MOUNT_RX_PIN, MOUNT_TX_PIN, MOUNT_BAUD);
 
-#if defined(ESP8266)
-  MountSerial.begin(MOUNT_BAUD);
-#else
-  MountSerial.begin(MOUNT_BAUD, SERIAL_8N1, MOUNT_RX_PIN, MOUNT_TX_PIN);
-#endif
+  mountTransportBegin();
   Serial.println("[BOOT] mount serial started");
 
   delay(200);
