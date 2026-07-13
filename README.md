@@ -23,6 +23,33 @@ Windows PowerShell:
 ./tools/compile-windows.ps1
 ```
 
+## Development workflow
+
+Run the static checks:
+
+```bash
+./scripts/test.sh
+```
+
+Compile the ESP32 firmware:
+
+```bash
+./scripts/build.sh
+```
+
+Run the full local verification:
+
+```bash
+./scripts/verify.sh
+```
+
+The development scripts support these environment overrides:
+
+- `ARDUINO_CLI`
+- `BUILD_PATH`
+- `OUTPUT_DIR`
+- `JOBS`
+
 ## Important mount constraints
 
 The original NexStar mount is strictly single-command. No new command may be accepted or forwarded while an earlier mount command is active. A completed command returns `@`. Position polling must not occur during an active GOTO, and AbortSlew is unsupported.
