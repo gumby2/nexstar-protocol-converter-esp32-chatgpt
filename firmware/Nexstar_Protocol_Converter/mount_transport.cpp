@@ -1,6 +1,7 @@
 #include "mount_transport.h"
 
 #include "logging.h"
+#include "network_services.h"
 #include "settings.h"
 
 #if defined(ESP8266)
@@ -43,8 +44,6 @@ bool mountCommFault = false;
 String lastMountFault = "No mount communication yet";
 bool mountBusy = false;
 bool suppressNextMountFault = false;
-
-void serviceNetworkDuringMountWait();
 
 void mountTransportBegin() {
 #if defined(ESP8266)
