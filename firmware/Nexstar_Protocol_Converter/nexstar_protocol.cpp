@@ -2,6 +2,7 @@
 
 #include "logging.h"
 #include "mount_transport.h"
+#include "observer_time.h"
 #include "settings.h"
 
 #include <math.h>
@@ -42,24 +43,6 @@ static double signedAzForMount(double az) {
   az = normalizeAz(az);
   if (az > 180.0) return az - 360.0;
   return az;
-}
-
-double normalizeRA(double ra) {
-  while (ra < 0.0) ra += 360.0;
-  while (ra >= 360.0) ra -= 360.0;
-  return ra;
-}
-
-double normalizeAz(double az) {
-  while (az < 0.0) az += 360.0;
-  while (az >= 360.0) az -= 360.0;
-  return az;
-}
-
-double clampAlt(double alt) {
-  if (alt > 90.0) return 90.0;
-  if (alt < -90.0) return -90.0;
-  return alt;
 }
 
 double numberToAngle(int16_t number) {

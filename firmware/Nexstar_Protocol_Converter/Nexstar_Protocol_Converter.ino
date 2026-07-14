@@ -3,6 +3,7 @@
 #include "lx200_protocol.h"
 #include "mount_transport.h"
 #include "nexstar_protocol.h"
+#include "observer_time.h"
 #include "settings.h"
 #include <math.h>
 #include <stddef.h>
@@ -169,24 +170,11 @@ String lastWifiStatus = "AP fallback";
 String startupModeSource = "saved settings";
 int startupModePinUsed = -1;
 
-enum TimeSource {
-  TIME_SRC_NONE = 0,
-  TIME_SRC_MANUAL = 1,
-  TIME_SRC_SKYSAFARI = 2,
-  TIME_SRC_WEB = 3,
-  TIME_SRC_NTP = 4
-};
-
-TimeSource currentTimeSource = TIME_SRC_NONE;
-String currentLocationSource = "None";
 double approxIpLatitudeDeg = 0.0;
 double approxIpLongitudeDeg = 0.0;
 String approxIpLocationText = "";
 String approxIpLocationStatus = "Not fetched";
 bool approxIpLocationValid = false;
-
-unsigned long lastNtpSyncMs = 0;
-bool ntpSyncValid = false;
 
 #if HAS_CLASSIC_BT
 BluetoothSerial SerialBT;
@@ -319,16 +307,6 @@ bool asyncNudgePending = false;
 bool asyncRaDecReadPending = false;
 bool asyncAltAzReadPending = false;
 
-bool timeValid = false;
-
-int localYear = 2026;
-int localMonth = 1;
-int localDay = 1;
-int localHour = 0;
-int localMinute = 0;
-int localSecond = 0;
-unsigned long timeSetMillis = 0;
-
 // Site/time updates received through Alpaca are staged here and applied from loop(),
 // not inside the HTTP handler. This avoids ESP8266 crashes caused by doing
 // String-heavy logging/recomputation while the web server is processing PUTs.
@@ -360,12 +338,6 @@ void startFallbackAP();
 
 // Full WiFi log lines are mirrored to serial by addLogLine().
 // Use LOG_* / LOG_*_CAT macros for formatted serial-visible logging.
-
-void computeAltAzFromRaDec();
-void computeRaDecFromAltAz();
-
-double degToRad(double d) { return d * PI / 180.0; }
-double radToDeg(double r) { return r * 180.0 / PI; }
 
 double rateToNudgeStep(double rate) {
   double r = fabs(rate);
@@ -437,224 +409,6 @@ bool nudgeAxis(int axis, double rate) {
   LOGE("Nudge failed: unsupported axis=%d", axis);
   return false;
 }
-
-long daysFromCivil(int y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  const int era = (y >= 0 ? y : y - 399) / 400;
-  const unsigned yoe = (unsigned)(y - era * 400);
-  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (int)(doe) - 719468;
-}
-
-int estimateUtcOffsetMinutesFromLongitude(double lonDeg) {
-  // Alpaca sends UTCDate, but it does not normally send a time-zone offset.
-  // For display and local-time math, estimate the standard-zone offset from longitude.
-  // Example: Colorado longitude around -104.8 gives -420 minutes.
-  int offset = (int)round(lonDeg / 15.0) * 60;
-  if (offset < -720) offset = -720;
-  if (offset > 840) offset = 840;
-  return offset;
-}
-
-void civilFromDays(long z, int &y, int &mo, int &d) {
-  z += 719468;
-  long era = (z >= 0 ? z : z - 146096) / 146097;
-  unsigned doe = (unsigned)(z - era * 146097);
-  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  y = (int)yoe + era * 400;
-  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  unsigned mp = (5 * doy + 2) / 153;
-  d = doy - (153 * mp + 2) / 5 + 1;
-  mo = mp + (mp < 10 ? 3 : -9);
-  y += (mo <= 2);
-}
-
-void setLocalFromUtcWithOffset(int uy, int umo, int ud, int uh, int umi, int usec, int offsetMinutes) {
-  long utcDays = daysFromCivil(uy, umo, ud);
-  long seconds = (long)uh * 3600L + (long)umi * 60L + (long)usec + (long)offsetMinutes * 60L;
-
-  while (seconds < 0) {
-    seconds += 86400L;
-    utcDays--;
-  }
-  while (seconds >= 86400L) {
-    seconds -= 86400L;
-    utcDays++;
-  }
-
-  civilFromDays(utcDays, localYear, localMonth, localDay);
-  localHour = seconds / 3600L;
-  seconds %= 3600L;
-  localMinute = seconds / 60L;
-  localSecond = seconds % 60L;
-}
-
-void currentUtcParts(int &y, int &mo, int &d, int &h, int &mi, int &se) {
-  unsigned long elapsed = timeValid ? (millis() - timeSetMillis) / 1000 : millis() / 1000;
-
-  long localSeconds =
-    (long)localHour * 3600L +
-    (long)localMinute * 60L +
-    (long)localSecond +
-    (long)elapsed;
-
-  long days = daysFromCivil(localYear, localMonth, localDay);
-  long utcSeconds = days * 86400L + localSeconds - (long)utcOffsetMinutes * 60L;
-
-  long utcDays = floor((double)utcSeconds / 86400.0);
-  long sod = utcSeconds - utcDays * 86400L;
-  if (sod < 0) {
-    sod += 86400L;
-    utcDays--;
-  }
-
-  h = sod / 3600;
-  sod %= 3600;
-  mi = sod / 60;
-  se = sod % 60;
-
-  long z = utcDays + 719468;
-  long era = (z >= 0 ? z : z - 146096) / 146097;
-  unsigned doe = (unsigned)(z - era * 146097);
-  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  y = (int)yoe + era * 400;
-  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  unsigned mp = (5 * doy + 2) / 153;
-  d = doy - (153 * mp + 2) / 5 + 1;
-  mo = mp + (mp < 10 ? 3 : -9);
-  y += (mo <= 2);
-}
-
-
-void currentLocalParts(int &y, int &mo, int &d, int &h, int &mi, int &se) {
-  unsigned long elapsed = timeValid ? (millis() - timeSetMillis) / 1000 : 0;
-
-  long localSeconds =
-    (long)localHour * 3600L +
-    (long)localMinute * 60L +
-    (long)localSecond +
-    (long)elapsed;
-
-  long days = daysFromCivil(localYear, localMonth, localDay);
-  long outSeconds = days * 86400L + localSeconds;
-
-  long outDays = floor((double)outSeconds / 86400.0);
-  long sod = outSeconds - outDays * 86400L;
-  if (sod < 0) {
-    sod += 86400L;
-    outDays--;
-  }
-
-  h = sod / 3600;
-  sod %= 3600;
-  mi = sod / 60;
-  se = sod % 60;
-
-  long z = outDays + 719468;
-  long era = (z >= 0 ? z : z - 146096) / 146097;
-  unsigned doe = (unsigned)(z - era * 146097);
-  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  y = (int)yoe + era * 400;
-  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  unsigned mp = (5 * doy + 2) / 153;
-  d = doy - (153 * mp + 2) / 5 + 1;
-  mo = mp + (mp < 10 ? 3 : -9);
-  y += (mo <= 2);
-}
-
-double julianDateUtc() {
-  int y, mo, d, h, mi, se;
-  currentUtcParts(y, mo, d, h, mi, se);
-
-  if (mo <= 2) {
-    y -= 1;
-    mo += 12;
-  }
-
-  int A = y / 100;
-  int B = 2 - A + A / 4;
-
-  double dayFrac = (h + mi / 60.0 + se / 3600.0) / 24.0;
-  double JD = floor(365.25 * (y + 4716)) +
-              floor(30.6001 * (mo + 1)) +
-              d + dayFrac + B - 1524.5;
-
-  return JD;
-}
-
-double gmstDegrees() {
-  double jd = julianDateUtc();
-  double T = (jd - 2451545.0) / 36525.0;
-
-  double gmst = 280.46061837 +
-                360.98564736629 * (jd - 2451545.0) +
-                0.000387933 * T * T -
-                (T * T * T) / 38710000.0;
-
-  return normalizeRA(gmst);
-}
-
-void computeAltAzFromRaDec() {
-  if (!cacheValid || !siteValid || !timeValid) return;
-
-  double lstDeg = normalizeRA(gmstDegrees() + siteLongitudeDeg);
-  double haDeg = normalizeRA(lstDeg - cachedRA_deg);
-  if (haDeg > 180.0) haDeg -= 360.0;
-
-  double ha = degToRad(haDeg);
-  double dec = degToRad(cachedDec_deg);
-  double lat = degToRad(siteLatitudeDeg);
-
-  double sinAlt = sin(dec) * sin(lat) + cos(dec) * cos(lat) * cos(ha);
-  sinAlt = constrain(sinAlt, -1.0, 1.0);
-  double alt = asin(sinAlt);
-
-  double cosAz = (sin(dec) - sin(alt) * sin(lat)) / (cos(alt) * cos(lat));
-  cosAz = constrain(cosAz, -1.0, 1.0);
-
-  double az = acos(cosAz);
-  if (sin(ha) > 0) az = 2.0 * PI - az;
-
-  cachedAlt_deg = radToDeg(alt);
-  cachedAz_deg = normalizeAz(radToDeg(az));
-  altAzCacheValid = true;
-  altAzComputed = true;
-  mountCurrentAlt_deg = cachedAlt_deg;
-  mountCurrentAz_deg = cachedAz_deg;
-  mountCurrentAltAzValid = true;
-  mountCurrentAltAzMs = millis();
-  lastComputedCoordMs = millis();
-}
-
-void computeRaDecFromAltAz() {
-  if (!altAzCacheValid || !siteValid || !timeValid) return;
-
-  double lstDeg = normalizeRA(gmstDegrees() + siteLongitudeDeg);
-  double alt = degToRad(cachedAlt_deg);
-  double az = degToRad(cachedAz_deg);
-  double lat = degToRad(siteLatitudeDeg);
-
-  double sinDec = sin(alt) * sin(lat) + cos(alt) * cos(lat) * cos(az);
-  sinDec = constrain(sinDec, -1.0, 1.0);
-  double dec = asin(sinDec);
-
-  double y = -sin(az) * cos(alt);
-  double x = sin(alt) * cos(lat) - cos(alt) * sin(lat) * cos(az);
-  double haDeg = normalizeRA(radToDeg(atan2(y, x)));
-  if (haDeg > 180.0) haDeg -= 360.0;
-
-  double ra = normalizeRA(lstDeg - haDeg);
-
-  cachedRA_deg = ra;
-  cachedDec_deg = radToDeg(dec);
-  cacheValid = true;
-  lastComputedCoordMs = millis();
-
-  LOGD("Computed RA/Dec from Alt/Az: RA_deg=%.6f DEC_deg=%.6f RA_hours=%.6f",
-       cachedRA_deg, cachedDec_deg, cachedRA_deg / 15.0);
-}
-
 
 void lx200Send(uint8_t source, const String &s) {
   if (source == LX_SRC_WIFI) {
@@ -1511,11 +1265,6 @@ bool safeFloatValue(const String &v, double &out) {
   return !isnan(out) && !isinf(out);
 }
 
-void invalidateComputedAltAz() {
-  if (altAzComputed) altAzCacheValid = false;
-  altAzComputed = false;
-}
-
 String formatUptime() {
   unsigned long seconds = millis() / 1000;
   unsigned long days = seconds / 86400;
@@ -1834,28 +1583,6 @@ String getLogText() {
 }
 
 
-
-const char* timeSourceName(TimeSource src) {
-  switch (src) {
-    case TIME_SRC_MANUAL: return "Manual";
-    case TIME_SRC_SKYSAFARI: return "SkySafari";
-    case TIME_SRC_WEB: return "Web";
-    case TIME_SRC_NTP: return "NTP";
-    default: return "None";
-  }
-}
-
-void markTimeSource(TimeSource src) {
-  currentTimeSource = src;
-}
-
-void markSkySafariTimeSource() {
-  markTimeSource(TIME_SRC_SKYSAFARI);
-}
-
-void markLocationSource(const String &src) {
-  currentLocationSource = src;
-}
 
 bool syncTimeFromNTP(bool forceLog = true) {
   if (forceLog) {
@@ -3605,45 +3332,6 @@ bool altWithinSafeLimits(double altDeg) {
   if (altDeg < 0.0) return false;
   if (!safeAltLimitEnabled) return true;
   return altDeg >= safeAltMinDeg && altDeg <= safeAltMaxDeg;
-}
-
-bool targetAltitudeFromRaDec(double raDeg, double decDeg, double &altDeg) {
-  if (!siteValid || !timeValid) return false;
-
-  double lstDeg = normalizeRA(gmstDegrees() + siteLongitudeDeg);
-  double haDeg = normalizeRA(lstDeg - normalizeRA(raDeg));
-  if (haDeg > 180.0) haDeg -= 360.0;
-
-  double ha = degToRad(haDeg);
-  double dec = degToRad(decDeg);
-  double lat = degToRad(siteLatitudeDeg);
-
-  double sinAlt = sin(dec) * sin(lat) + cos(dec) * cos(lat) * cos(ha);
-  sinAlt = constrain(sinAlt, -1.0, 1.0);
-  altDeg = radToDeg(asin(sinAlt));
-  return true;
-}
-
-bool targetRaDecFromAltAz(double altDeg, double azDeg, double &raDeg, double &decDeg) {
-  if (!siteValid || !timeValid) return false;
-
-  double lstDeg = normalizeRA(gmstDegrees() + siteLongitudeDeg);
-  double alt = degToRad(altDeg);
-  double az = degToRad(normalizeAz(azDeg));
-  double lat = degToRad(siteLatitudeDeg);
-
-  double sinDec = sin(alt) * sin(lat) + cos(alt) * cos(lat) * cos(az);
-  sinDec = constrain(sinDec, -1.0, 1.0);
-  double dec = asin(sinDec);
-
-  double y = -sin(az) * cos(alt);
-  double x = sin(alt) * cos(lat) - cos(alt) * sin(lat) * cos(az);
-  double haDeg = normalizeRA(radToDeg(atan2(y, x)));
-  if (haDeg > 180.0) haDeg -= 360.0;
-
-  raDeg = normalizeRA(lstDeg - haDeg);
-  decDeg = radToDeg(dec);
-  return true;
 }
 
 bool allowSlewRaDecBySafety(double raDeg, double decDeg, String &reason) {
@@ -7440,49 +7128,91 @@ String httpParamValue(const String &url, const String &name) {
 
 void applyHttpsBrowserTimeLocationFromUrl(const String &url, bool &gotLocation) {
   gotLocation = false;
+  double latDeg = siteLatitudeDeg;
+  double lonDeg = siteLongitudeDeg;
+  bool hasElevation = false;
+  double elevationMeters = siteElevationMeters;
+  bool hasOffset = false;
+  int offsetMinutes = utcOffsetMinutes;
+  bool hasYear = false;
+  int year = localYear;
+  bool hasMonth = false;
+  int month = localMonth;
+  bool hasDay = false;
+  int day = localDay;
+  bool hasHour = false;
+  int hour = localHour;
+  bool hasMinute = false;
+  int minute = localMinute;
+  bool hasSecond = false;
+  int second = localSecond;
 
   String v;
   v = httpParamValue(url, "lat");
   if (v.length()) {
-    siteLatitudeDeg = v.toFloat();
+    latDeg = v.toFloat();
     gotLocation = true;
   }
   v = httpParamValue(url, "lon");
   if (v.length()) {
-    siteLongitudeDeg = v.toFloat();
+    lonDeg = v.toFloat();
     gotLocation = true;
-  }
-  if (gotLocation) {
-    siteValid = true;
-    markLocationSource("Browser HTTPS");
   }
 
   v = httpParamValue(url, "elev");
-  if (v.length()) siteElevationMeters = v.toFloat();
+  if (v.length()) {
+    hasElevation = true;
+    elevationMeters = v.toFloat();
+  }
 
   v = httpParamValue(url, "offset");
   if (v.length()) {
-    utcOffsetMinutes = v.toInt();
-    utcOffsetSource = "browser/https";
+    hasOffset = true;
+    offsetMinutes = v.toInt();
   }
 
   v = httpParamValue(url, "year");
-  if (v.length()) localYear = v.toInt();
+  if (v.length()) {
+    hasYear = true;
+    year = v.toInt();
+  }
   v = httpParamValue(url, "month");
-  if (v.length()) localMonth = v.toInt();
+  if (v.length()) {
+    hasMonth = true;
+    month = v.toInt();
+  }
   v = httpParamValue(url, "day");
-  if (v.length()) localDay = v.toInt();
+  if (v.length()) {
+    hasDay = true;
+    day = v.toInt();
+  }
   v = httpParamValue(url, "hour");
-  if (v.length()) localHour = v.toInt();
+  if (v.length()) {
+    hasHour = true;
+    hour = v.toInt();
+  }
   v = httpParamValue(url, "minute");
-  if (v.length()) localMinute = v.toInt();
+  if (v.length()) {
+    hasMinute = true;
+    minute = v.toInt();
+  }
   v = httpParamValue(url, "second");
-  if (v.length()) localSecond = v.toInt();
+  if (v.length()) {
+    hasSecond = true;
+    second = v.toInt();
+  }
 
-  timeValid = true;
-  markTimeSource(TIME_SRC_WEB);
-  timeSetMillis = millis();
-  computeAltAzFromRaDec();
+  applyHttpsBrowserTimeLocationValues(
+    gotLocation, latDeg, lonDeg,
+    hasElevation, elevationMeters,
+    hasOffset, offsetMinutes,
+    hasYear, year,
+    hasMonth, month,
+    hasDay, day,
+    hasHour, hour,
+    hasMinute, minute,
+    hasSecond, second
+  );
   savePersistentSettings();
 
   LOG_TIME_I("Browser HTTPS site/time update: location=%s lat=%.6f lon=%.6f offset=%d date=%04d-%02d-%02d time=%02d:%02d:%02d",

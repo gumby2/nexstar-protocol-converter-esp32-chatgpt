@@ -2,6 +2,7 @@
 
 #include "logging.h"
 #include "nexstar_protocol.h"
+#include "observer_time.h"
 #include "settings.h"
 
 #include <math.h>
@@ -30,14 +31,6 @@ static const size_t LX200_MAX_CMD_LEN = 96;
 static double lx200TargetRA_deg = 0.0;
 static double lx200TargetDec_deg = 0.0;
 
-extern bool timeValid;
-extern int localYear;
-extern int localMonth;
-extern int localDay;
-extern int localHour;
-extern int localMinute;
-extern int localSecond;
-extern unsigned long timeSetMillis;
 extern bool asyncSlewRunning;
 extern bool asyncSlewPending;
 extern bool asyncAltAzSlewPending;
@@ -65,9 +58,6 @@ void clearPendingReadRequestsForLX200Goto(const char* srcName);
 void queueAsyncSlew(double raDeg, double decDeg);
 void queueAsyncAltAzSlew(double altDeg, double azDeg);
 bool hasQueuedGoto();
-void computeAltAzFromRaDec();
-void markLocationSource(const String &src);
-void markSkySafariTimeSource();
 bool savePersistentSettings();
 
 double parseLX200RA(String cmd) {

@@ -61,17 +61,8 @@ unsigned long gotoQueueTimeoutMs = 10000UL;
 unsigned long lastPersistentSaveMs = 0;
 uint32_t persistentSaveCount = 0;
 
-double siteLatitudeDeg = 0.0;
-double siteLongitudeDeg = 0.0;
-double siteElevationMeters = 0.0;
-int utcOffsetMinutes = 0;
-String utcOffsetSource = "unset";
-bool siteValid = false;
-
 extern bool tinyWebServerRuntimeEnabled;
 extern bool staConnected;
-extern bool timeValid;
-extern String currentLocationSource;
 extern unsigned long nextMountPollDueMs;
 extern unsigned long sanitizeGotoQueueTimeoutMs(unsigned long v);
 

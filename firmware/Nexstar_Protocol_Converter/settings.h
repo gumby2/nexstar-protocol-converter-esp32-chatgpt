@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include "observer_time.h"
 
 extern const char* AP_SSID;
 extern const char* AP_PASS;
@@ -55,13 +56,6 @@ extern unsigned long minClientPollIntervalMs;
 extern unsigned long gotoQueueTimeoutMs;
 extern unsigned long lastPersistentSaveMs;
 extern uint32_t persistentSaveCount;
-
-extern double siteLatitudeDeg;
-extern double siteLongitudeDeg;
-extern double siteElevationMeters;
-extern int utcOffsetMinutes;
-extern String utcOffsetSource;
-extern bool siteValid;
 
 extern const uint32_t SETTINGS_MAGIC;
 extern const uint16_t SETTINGS_VERSION;

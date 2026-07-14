@@ -2,10 +2,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
-
-double normalizeRA(double ra);
-double normalizeAz(double az);
-double clampAlt(double alt);
+#include "observer_time.h"
 
 double numberToAngle(int16_t number);
 int16_t angleToNumber(double angleDeg);
