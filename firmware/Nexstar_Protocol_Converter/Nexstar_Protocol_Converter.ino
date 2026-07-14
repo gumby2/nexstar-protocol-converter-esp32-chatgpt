@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "bluetooth_services.h"
 #include "logging.h"
 #include "lx200_protocol.h"
 #include "mount_transport.h"
@@ -30,25 +31,12 @@
   #include <WebServer.h>
 
   #include <WiFiUdp.h>
-  #include <BluetoothSerial.h>
   extern "C" {
     #include "esp_https_server.h"
-    #include "esp_coexist.h"
   }
   #include "esp_system.h"
   #include "freertos/FreeRTOS.h"
   #include "freertos/task.h"
-#endif
-
-#if defined(ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2)
-  // Classic BT shares radio resources with WiFi on ESP32. Keep the feature in
-  // the sketch, but make it an explicit build-time mode while WiFi/TCP is debugged.
-  #ifndef ENABLE_CLASSIC_BT
-    #define ENABLE_CLASSIC_BT 1
-  #endif
-  #define HAS_CLASSIC_BT ENABLE_CLASSIC_BT
-#else
-  #define HAS_CLASSIC_BT 0
 #endif
 
 // ESP32 keeps AP fallback up, but saved STA credentials should survive reboot.
@@ -57,11 +45,6 @@ const bool ESP32_DISABLE_LITTLEFS_SETTINGS = true; // ESP32 uses Preferences/NVS
 const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
-bool bluetoothRuntimeEnabled = false;
-String coexPreferenceText = "default";
-int coexPreferenceResult = 0;
-
-const char* BT_NAME = "NexStar_Bridge";
 
 const char* FW_VERSION = "v5.29";
 const char* FW_NAME = "NexStar Protocol Converter";
@@ -76,7 +59,6 @@ extern const bool SERIAL_MIRROR_FULL_WIFI_LOGS = true; // mirror the same format
 // HTTPS setup credentials and state are stored separately.
 #include "https_credentials.h"
 
-bool lx200BtClientConnected = false;
 uint32_t positionApiCacheReplies = 0;
 uint32_t positionApiCacheMisses = 0;
 String serialPendingConfirmCommand = "";
@@ -91,10 +73,6 @@ double approxIpLongitudeDeg = 0.0;
 String approxIpLocationText = "";
 String approxIpLocationStatus = "Not fetched";
 bool approxIpLocationValid = false;
-
-#if HAS_CLASSIC_BT
-BluetoothSerial SerialBT;
-#endif
 
 const char* currentWebRequestPath = "";
 
@@ -131,7 +109,6 @@ int pendingLocalSecond = 0;
 
 uint32_t serverTransactionID = 0;
 
-void handleBluetoothLX200();
 void serviceGotoCompletionWatch();
 void serviceGotoQueue();
 
@@ -177,20 +154,9 @@ void lx200Send(uint8_t source, const String &s) {
     }
   }
 
-#if HAS_CLASSIC_BT
   if (source == LX_SRC_BT) {
-    if (SerialBT.hasClient()) {
-      SerialBT.print(s);
-      SerialBT.flush();
-      lx200BtLastTxMs = millis();
-      lx200BtTxReplies++;
-      lx200BtLastReply = s;
-      if (!lx200SuppressNextReplyLog) {
-        LOG_SKY_D("LX200 BT TX reply #%lu: %s", (unsigned long)lx200BtTxReplies, s.c_str());
-      }
-    }
+    bluetoothSendLX200Response(s);
   }
-#endif
 }
 
 bool positionDemandClientConnected() {
@@ -198,9 +164,7 @@ bool positionDemandClientConnected() {
     if (lx200Client && lx200Client.connected()) return true;
     if (stellariumClientConnected) return true;
   }
-#if HAS_CLASSIC_BT
-  if (bluetoothRuntimeEnabled && SerialBT.hasClient()) return true;
-#endif
+  if (bluetoothClientConnected()) return true;
   return false;
 }
 
@@ -209,11 +173,9 @@ bool routeLX200SourceThroughCommonMountCore(uint8_t source) {
     return processLX200Stream(lx200Client, source);
   }
 
-#if HAS_CLASSIC_BT
   if (source == LX_SRC_BT) {
-    return processLX200Stream(SerialBT, source);
+    return bluetoothProcessLX200Stream();
   }
-#endif
 
   return false;
 }
@@ -364,40 +326,6 @@ void handleStellariumPacket(uint8_t *pkt, uint16_t len) {
 
   stellariumBadPackets++;
   LOG_STEL_W("Stellarium RX short/unknown packet len=%u type=%u", len, type);
-}
-
-void handleBluetoothLX200() {
-#if HAS_CLASSIC_BT
-  if (!bluetoothRuntimeEnabled) return;
-  bool nowConnected = SerialBT.hasClient();
-
-  if (nowConnected && !lx200BtClientConnected) {
-    LOG_BT_I("Bluetooth LX200/SkySafari client connected");
-    LOG_BT_D("Bluetooth SkySafari connected: idle background mount polling remains enabled; SkySafari polls use latest cache");
-    LOG_BT_I("Bluetooth client active; WiFi/Telnet will remain enabled unless wifi off is requested");
-    btClientConnectedAtMs = millis();
-    btAutoWifiOffDone = false;
-    lx200BtLastRxMs = 0;
-    lx200BtLastTxMs = 0;
-    lx200BtLastCommand = "";
-    lx200BtLastReply = "";
-    lx200BtLastUnhandled = "";
-    lx200BtGotoStageCommands = 0;
-    lx200BtPollOnlyHintCount = 0;
-    resetMountPollFailures();
-    invalidateCachesAfterGoto();
-  } else if (!nowConnected && lx200BtClientConnected) {
-    LOG_BT_I("Bluetooth LX200/SkySafari client disconnected");
-    btClientConnectedAtMs = 0;
-  }
-
-  lx200BtClientConnected = nowConnected;
-  if (!nowConnected) return;
-
-  // Match the stable Full WiFi LX200 behavior: process one complete command
-  // per loop pass through the same shared LX200-to-mount command core used by WiFi.
-  routeLX200SourceThroughCommonMountCore(LX_SRC_BT);
-#endif
 }
 
 String jsonEscape(const String &s) {
@@ -839,9 +767,9 @@ String currentStateText() {
   s += "Alpaca client active: " + String(alpacaConnected ? "yes" : "no") + "\n";
   s += "SkySafari/LX200 WiFi: " + String((lx200Client && lx200Client.connected()) ? "connected" : "idle") + "\n";
   s += "Stellarium: " + String((bridgeMode == BRIDGE_MODE_WIFI_FULL && stellariumClientConnected) ? "connected" : "idle") + "\n";
-  s += "Bluetooth enabled: " + String(bluetoothRuntimeEnabled ? "yes" : "no") + "\n";
+  s += "Bluetooth enabled: " + String(bluetoothRuntimeIsEnabled() ? "yes" : "no") + "\n";
 #if HAS_CLASSIC_BT
-  s += "Bluetooth client: " + String((bluetoothRuntimeEnabled && SerialBT.hasClient()) ? "connected" : "idle") + "\n";
+  s += "Bluetooth client: " + String(bluetoothClientConnected() ? "connected" : "idle") + "\n";
 #endif
   s += "Web HTTP port: " + String(HTTP_WEB_PORT) + "\n";
   s += "Alpaca/LX200/Discovery ports: " + String(bridgeMode == BRIDGE_MODE_WIFI_FULL ? ALPACA_PORT : 0) + "/" + String(bridgeMode == BRIDGE_MODE_WIFI_FULL ? LX200_PORT : 0) + "/" + String(bridgeMode == BRIDGE_MODE_WIFI_FULL ? ALPACA_DISCOVERY_PORT : 0) + "\n\n";
@@ -1151,7 +1079,7 @@ String tinyRebootRedirectPage(const String &title, const String &ret) {
 String tinyBtStatusJson() {
   bool btConnected = false;
 #if HAS_CLASSIC_BT
-  btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConnected = bluetoothClientConnected();
 #endif
   String json;
   json.reserve(1300);
@@ -1161,7 +1089,7 @@ String tinyBtStatusJson() {
   json += "\"apIp\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"staIp\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"staConnected\":" + String((staConnected && WiFi.status() == WL_CONNECTED) ? "true" : "false") + ",";
-  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeEnabled ? "true" : "false") + ",";
+  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
   json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
   json += "\"lx200BtRxCommands\":" + String(lx200BtRxCommands) + ",";
   json += "\"lx200BtTxReplies\":" + String(lx200BtTxReplies) + ",";
@@ -1198,7 +1126,7 @@ String tinyStatusPage() {
 
   bool btConnected = false;
 #if HAS_CLASSIC_BT
-  btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConnected = bluetoothClientConnected();
 #endif
 
   page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
@@ -1312,7 +1240,7 @@ void serviceTinySetupServer() {
 #if defined(ESP32)
   if (bridgeMode != BRIDGE_MODE_BT_MIN_WEB) return;
   if (!wifiRuntimeEnabled) return;
-  if (!tinyWebServerRuntimeEnabled) return;
+  if (!bluetoothTinyWebRuntimeEnabled()) return;
   WiFiClient c = tinySetupServer.available();
   if (!c) return;
 
@@ -1649,7 +1577,7 @@ void handleBtStatusPage() {
   logHttpRequest("BT_STATUS");
   bool btConnected = false;
 #if HAS_CLASSIC_BT
-  btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConnected = bluetoothClientConnected();
 #endif
   int dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond;
   currentLocalParts(dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond);
@@ -1661,7 +1589,7 @@ void handleBtStatusPage() {
   json += "\"apIp\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"staIp\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"staConnected\":" + String((staConnected && WiFi.status() == WL_CONNECTED) ? "true" : "false") + ",";
-  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeEnabled ? "true" : "false") + ",";
+  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
   json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
   json += "\"lx200BtRxCommands\":" + String(lx200BtRxCommands) + ",";
   json += "\"lx200BtTxReplies\":" + String(lx200BtTxReplies) + ",";
@@ -1701,7 +1629,7 @@ void handleStatusPage() {
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
     bool btConnected = false;
 #if HAS_CLASSIC_BT
-    btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+    btConnected = bluetoothClientConnected();
 #endif
     int dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond;
     currentLocalParts(dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond);
@@ -1720,10 +1648,10 @@ void handleStatusPage() {
     json += "\"alpacaDiscoveryPort\":0,";
     json += "\"lx200Port\":0,";
     json += "\"stellariumPort\":0,";
-    json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeEnabled ? "true" : "false") + ",";
+    json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
     json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
-    json += "\"coexPreference\":\"" + jsonEscape(coexPreferenceText) + "\",";
-    json += "\"coexPreferenceResult\":" + String(coexPreferenceResult) + ",";
+    json += "\"coexPreference\":\"" + jsonEscape(bluetoothCoexPreferenceText()) + "\",";
+    json += "\"coexPreferenceResult\":" + String(bluetoothCoexPreferenceResult()) + ",";
     json += "\"lx200BtRxCommands\":" + String(lx200BtRxCommands) + ",";
     json += "\"lx200BtTxReplies\":" + String(lx200BtTxReplies) + ",";
     json += "\"lx200BtUnhandled\":" + String(lx200BtUnhandledCommands) + ",";
@@ -1771,7 +1699,7 @@ void handleStatusPage() {
 
   bool btConnected = false;
 #if HAS_CLASSIC_BT
-  btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConnected = bluetoothClientConnected();
 #endif
   bool fullProtocolMode = (bridgeMode == BRIDGE_MODE_WIFI_FULL);
 
@@ -1808,7 +1736,7 @@ void handleStatusPage() {
   json += "\"lx200WifiUnhandled\":" + String(fullProtocolMode ? lx200WifiUnhandledCommands : 0) + ",";
   json += "\"lx200WifiLastRxAgeMs\":" + String((fullProtocolMode && lx200WifiLastRxMs) ? millis() - lx200WifiLastRxMs : 0) + ",";
   json += "\"lx200WifiLastTxAgeMs\":" + String((fullProtocolMode && lx200WifiLastTxMs) ? millis() - lx200WifiLastTxMs : 0) + ",";
-  json += "\"lx200BtConnected\":" + String(lx200BtClientConnected ? "true" : "false") + ",";
+  json += "\"lx200BtConnected\":" + String(bluetoothLX200ClientConnected() ? "true" : "false") + ",";
   json += "\"lx200BtRxCommands\":" + String(lx200BtRxCommands) + ",";
   json += "\"lx200BtTxReplies\":" + String(lx200BtTxReplies) + ",";
   json += "\"lx200BtUnhandled\":" + String(lx200BtUnhandledCommands) + ",";
@@ -1838,7 +1766,7 @@ void handleStatusPage() {
   json += "\"telnetRxCommands\":" + String(telnetRxCommands) + ",";
   json += "\"telnetAuthFailures\":" + String(telnetAuthFailures) + ",";
   json += "\"bridgeMode\":\"" + jsonEscape(String(bridgeModeName())) + "\",";
-  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeEnabled ? "true" : "false") + ",";
+  json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
   json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
   json += "\"logLevel\":" + String(LOG_LEVEL) + ",";
   json += "\"logLevelName\":\"" + String(logLevelName(LOG_LEVEL)) + "\",";
@@ -3269,8 +3197,8 @@ void handleHttpHealthPage() {
   s += "Alpaca HTTP port: " + String(bridgeMode == BRIDGE_MODE_WIFI_FULL ? ALPACA_PORT : 0) + "\n";
   s += "AP IP: " + WiFi.softAPIP().toString() + "\n";
   s += "STA IP: " + WiFi.localIP().toString() + "\n";
-  s += "Bluetooth SkySafari: " + String(bluetoothRuntimeEnabled ? "enabled" : "disabled") + "\n";
-  s += "Coex preference: " + coexPreferenceText + " result=" + String(coexPreferenceResult) + "\n";
+  s += "Bluetooth SkySafari: " + String(bluetoothRuntimeIsEnabled() ? "enabled" : "disabled") + "\n";
+  s += "Coex preference: " + bluetoothCoexPreferenceText() + " result=" + String(bluetoothCoexPreferenceResult()) + "\n";
   s += "HTTPS port: " + String(HTTPS_SETUP_PORT) + "\n";
   sendNoCacheHeaders();
   server.sendHeader("Connection", "close");
@@ -3348,7 +3276,7 @@ void redirectToHttpsSetup443() {
 void sendMinimalWebPage() {
   bool btConn = false;
 #if HAS_CLASSIC_BT
-  btConn = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConn = bluetoothClientConnected();
 #endif
   String page;
   page.reserve(4200);
@@ -3370,7 +3298,7 @@ void sendMinimalWebPage() {
   page += F("</h2><div class='box'><b>Mode:</b> <span id='m'>");
   page += bridgeModeName();
   page += F("</span><br><b>Bluetooth SkySafari:</b> <span id='bt' class='");
-  page += btConn ? F("ok'>connected") : (bluetoothRuntimeEnabled ? F("warn'>waiting") : F("bad'>disabled"));
+  page += btConn ? F("ok'>connected") : (bluetoothRuntimeIsEnabled() ? F("warn'>waiting") : F("bad'>disabled"));
   page += F("</span><br><b>BT name:</b> ");
   page += runtimeBtName();
   page += F("<br><b>AP:</b> <span id='ap'>");
@@ -4186,7 +4114,7 @@ void printConsoleStatus() {
   Serial.printf("STA IP: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("Last STA IP: %s\n", lastStaIp.c_str());
   Serial.printf("BT tiny web boot option: %s\n", btLiteBootWebEnabled ? "enabled" : "disabled / Telnet-only");
-  Serial.printf("BT tiny web server runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+  Serial.printf("BT tiny web server runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
   Serial.printf("Active poll interval: %lu ms\n", pollIntervalMs);
   Serial.printf("Idle poll interval: %lu ms\n", idlePollIntervalMs);
   Serial.printf("Effective poll interval: %lu ms (%s)\n",
@@ -4236,8 +4164,8 @@ void printConsoleStatus() {
   Serial.printf("Min free heap: %u bytes\n", ESP.getMinFreeHeap());
 #endif
 #if HAS_CLASSIC_BT
-  Serial.printf("Bluetooth enabled: %d\n", bluetoothRuntimeEnabled ? 1 : 0);
-  Serial.printf("Bluetooth client: %d\n", SerialBT.hasClient() ? 1 : 0);
+  Serial.printf("Bluetooth enabled: %d\n", bluetoothRuntimeIsEnabled() ? 1 : 0);
+  Serial.printf("Bluetooth client: %d\n", bluetoothClientConnected() ? 1 : 0);
 #else
   Serial.println("Bluetooth enabled: 0");
 #endif
@@ -4352,15 +4280,15 @@ void telnetPrintStatus(Print &out) {
              mountPollsMissedDeadline);
   out.printf("Loop latency current/max=%lu/%lu ms\n", lastLoopLatencyMs, maxLoopLatencyMs);
   out.printf("BT tiny web boot option: %s\n", btLiteBootWebEnabled ? "enabled" : "disabled / Telnet-only");
-  out.printf("BT tiny web server runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+  out.printf("BT tiny web server runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
   out.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
   out.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 #if defined(ESP32)
   out.printf("Min free heap: %u bytes\n", ESP.getMinFreeHeap());
 #endif
 #if HAS_CLASSIC_BT
-  out.printf("Bluetooth runtime: %s\n", bluetoothRuntimeEnabled ? "enabled" : "disabled");
-  out.printf("Bluetooth client: %s\n", (bluetoothRuntimeEnabled && SerialBT.hasClient()) ? "connected" : "not connected");
+  out.printf("Bluetooth runtime: %s\n", bluetoothRuntimeIsEnabled() ? "enabled" : "disabled");
+  out.printf("Bluetooth client: %s\n", bluetoothClientConnected() ? "connected" : "not connected");
 #endif
   out.printf("Mount alive: %s\n", mountAlive() ? "yes" : "unknown/no recent response");
   out.printf("Mount fault: %s\n", mountCommFault ? "yes" : "no");
@@ -4751,7 +4679,7 @@ unsigned long parseIntervalArgumentMs(const String &cmd, const String &commandNa
 void telnetDrawMonitor(Print &out) {
   bool btConnected = false;
 #if HAS_CLASSIC_BT
-  btConnected = bluetoothRuntimeEnabled && SerialBT.hasClient();
+  btConnected = bluetoothClientConnected();
 #endif
   bool skyWifiConnected = lx200Client && lx200Client.connected();
   bool stelConnected = stellariumClient && stellariumClient.connected();
@@ -4799,7 +4727,7 @@ void telnetDrawMonitor(Print &out) {
              lx200WifiUnhandledCommands);
   out.printf("%-12s %-12s %-12lu %-12lu %-12lu\n",
              "Sky BT",
-             btConnected ? "connected" : (bluetoothRuntimeEnabled ? "waiting" : "disabled"),
+             btConnected ? "connected" : (bluetoothRuntimeIsEnabled() ? "waiting" : "disabled"),
              lx200BtTxReplies,
              lx200BtRxCommands,
              lx200BtUnhandledCommands);
@@ -5077,24 +5005,24 @@ void telnetRunCommand(String line, Print &out) {
                (unsigned long)telnetLiveLogLines);
   }
   else if (cmd == "web" || cmd == "web status" || cmd == "webserver" || cmd == "webserver status") {
-    out.printf("BT tiny web server runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    out.printf("BT tiny web server runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
     out.println("Commands: web on | web off | web toggle");
   }
   else if (cmd == "web on" || cmd == "webserver on") {
-    tinyWebServerRuntimeEnabled = true;
+    setBluetoothTinyWebRuntimeEnabled(true);
     out.println("BT tiny web server runtime enabled.");
   }
   else if (cmd == "web off" || cmd == "webserver off") {
-    tinyWebServerRuntimeEnabled = false;
+    setBluetoothTinyWebRuntimeEnabled(false);
     out.println("BT tiny web server runtime disabled.");
   }
   else if (cmd == "web toggle" || cmd == "webserver toggle") {
-    tinyWebServerRuntimeEnabled = !tinyWebServerRuntimeEnabled;
-    out.printf("BT tiny web server runtime now: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    toggleBluetoothTinyWebRuntimeEnabled();
+    out.printf("BT tiny web server runtime now: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
   }
   else if (cmd == "wifi" || cmd == "wifi status") {
     out.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
-    out.printf("Tiny web runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    out.printf("Tiny web runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
     out.printf("WiFi mode text: %s\n", wifiModeText.c_str());
     out.printf("AP running: %d AP IP: %s STA connected: %d STA IP: %s\n",
                apRunning ? 1 : 0,
@@ -5398,29 +5326,29 @@ void handleConsole() {
   }
 
   else if (cmd == "web" || cmd == "web status" || cmd == "webserver" || cmd == "webserver status") {
-    Serial.printf("BT tiny web server runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    Serial.printf("BT tiny web server runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
     Serial.println("Commands: web on | web off | web toggle");
     Serial.println("Note: runtime only; reboot restores enabled.");
   }
 
   else if (cmd == "web on" || cmd == "webserver on") {
-    tinyWebServerRuntimeEnabled = true;
+    setBluetoothTinyWebRuntimeEnabled(true);
     Serial.println("BT tiny web server runtime enabled.");
   }
 
   else if (cmd == "web off" || cmd == "webserver off") {
-    tinyWebServerRuntimeEnabled = false;
+    setBluetoothTinyWebRuntimeEnabled(false);
     Serial.println("BT tiny web server runtime disabled. Use serial 'web on' to re-enable, or reboot.");
   }
 
   else if (cmd == "web toggle" || cmd == "webserver toggle") {
-    tinyWebServerRuntimeEnabled = !tinyWebServerRuntimeEnabled;
-    Serial.printf("BT tiny web server runtime now: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    toggleBluetoothTinyWebRuntimeEnabled();
+    Serial.printf("BT tiny web server runtime now: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
   }
 
   else if (cmd == "wifi" || cmd == "wifi status") {
     Serial.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
-    Serial.printf("Tiny web runtime: %s\n", tinyWebServerRuntimeEnabled ? "enabled" : "disabled");
+    Serial.printf("Tiny web runtime: %s\n", bluetoothTinyWebRuntimeEnabled() ? "enabled" : "disabled");
     Serial.printf("WiFi mode text: %s\n", wifiModeText.c_str());
     Serial.printf("AP running: %d AP IP: %s STA connected: %d STA IP: %s\n",
                   apRunning ? 1 : 0,
@@ -5967,11 +5895,6 @@ String runtimeApSsid() {
   return appendMacSuffixToName(apSsid);
 }
 
-String runtimeBtName() {
-  return appendMacSuffixToName(String(BT_NAME));
-}
-
-
 void handleFullWifiRebootPage() {
   String ret = requestedReturnUrl();
   if (ret.length() == 0 || !ret.startsWith("http://")) ret = currentRequestBaseUrl();
@@ -6065,7 +5988,7 @@ delay(500);
     delay(150);
     staRuntimeDisabled = false; // BT should use saved STA when configured, not force AP-only
     setupWiFiFromSavedConfig();
-    tinyWebServerRuntimeEnabled = btLiteBootWebEnabled;
+    setBluetoothTinyWebRuntimeEnabled(btLiteBootWebEnabled);
     if (btLiteBootWebEnabled) {
       startTinySetupServer();
       Serial.println("[BT_MIN] tiny setup web server active");
@@ -6104,37 +6027,10 @@ delay(500);
   }
 
 #if defined(ESP32)
-  if (ESP32_BOOT_WEB_ONLY || bridgeMode == BRIDGE_MODE_WIFI_FULL) {
-    Serial.println("[WEB_ONLY] Bluetooth init skipped");
-  } else
-#endif
-  {
-#if HAS_CLASSIC_BT
-    bool btOk = SerialBT.begin(runtimeBtName(), false, true);
-    if (!btOk) {
-      Serial.println("Bluetooth SPP first start failed; retrying once");
-      SerialBT.end();
-      delay(500);
-      btOk = SerialBT.begin(runtimeBtName(), false, true);
-    }
-    if (btOk) {
-      bluetoothRuntimeEnabled = true;
-      Serial.printf("Bluetooth SPP name: %s\n", runtimeBtName().c_str());
-#if defined(ESP32)
-      coexPreferenceResult = (int)esp_coex_preference_set(ESP_COEX_PREFER_BT);
-      coexPreferenceText = "prefer_bt";
-      Serial.printf("[COEX] preference=%s result=%d version=%s\n",
-                    coexPreferenceText.c_str(),
-                    coexPreferenceResult,
-                    esp_coex_version_get());
-#endif
-    } else {
-      Serial.println("Bluetooth SPP failed to start");
-    }
+  setupBluetoothService(ESP32_BOOT_WEB_ONLY || bridgeMode == BRIDGE_MODE_WIFI_FULL);
 #else
-    Serial.println("Bluetooth SPP disabled on this board");
+  setupBluetoothService(false);
 #endif
-  }
 
   allocateNetworkServiceObjects();
 
@@ -6245,7 +6141,7 @@ delay(500);
     LOGI("Alpaca discovery listening on UDP %u", ALPACA_DISCOVERY_PORT);
   }
 #if HAS_CLASSIC_BT
-  if (bluetoothRuntimeEnabled) LOG_SKY_I("Bluetooth LX200 SPP ready as %s", BT_NAME);
+  if (bluetoothRuntimeIsEnabled()) LOG_SKY_I("Bluetooth LX200 SPP ready as %s", bluetoothBaseName());
 #endif
 
   printHelp();
@@ -6308,20 +6204,7 @@ void loop() {
     serviceTelnetConsole();
     serviceMountPolling();
     handleBluetoothLX200();
-#if HAS_CLASSIC_BT
-    if (BT_AUTO_WIFI_OFF_ON_CLIENT &&
-        bridgeMode == BRIDGE_MODE_BT_MIN_WEB &&
-        bluetoothRuntimeEnabled &&
-        SerialBT.hasClient() &&
-        wifiRuntimeEnabled &&
-        !btAutoWifiOffDone &&
-        btClientConnectedAtMs != 0 &&
-        millis() - btClientConnectedAtMs > 1500UL) {
-      btAutoWifiOffDone = true;
-      Serial.println("[BT_MIN] Bluetooth client active; turning WiFi off for BT stability");
-      runtimeWifiOff();
-    }
-#endif
+    serviceBluetoothClientWifiCoexistence();
     serviceMountPolling();
     serviceGotoCompletionWatch();
     serviceGotoQueue();

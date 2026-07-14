@@ -15,19 +15,8 @@ uint32_t lx200WifiRxCommands = 0;
 uint32_t lx200WifiTxReplies = 0;
 uint32_t lx200WifiUnhandledCommands = 0;
 
-unsigned long lx200BtLastRxMs = 0;
-unsigned long lx200BtLastTxMs = 0;
-uint32_t lx200BtRxCommands = 0;
-uint32_t lx200BtTxReplies = 0;
-uint32_t lx200BtUnhandledCommands = 0;
-String lx200BtLastCommand = "";
-String lx200BtLastReply = "";
-String lx200BtLastUnhandled = "";
 bool lx200SuppressNextReplyLog = false;
-uint32_t lx200BtGotoStageCommands = 0;
-uint32_t lx200BtPollOnlyHintCount = 0;
 uint32_t lx200CommonRouterCommands = 0;
-unsigned long lx200BtLastCommandHandledMs = 0;
 
 static const size_t LX200_MAX_CMD_LEN = 96;
 static double lx200TargetRA_deg = 0.0;

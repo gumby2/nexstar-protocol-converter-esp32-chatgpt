@@ -1,24 +1,11 @@
 #include "network_services.h"
 
+#include "bluetooth_services.h"
 #include "logging.h"
 #include "lx200_protocol.h"
 #include "settings.h"
 
 #include <string.h>
-
-#if defined(ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2)
-  #ifndef ENABLE_CLASSIC_BT
-    #define ENABLE_CLASSIC_BT 1
-  #endif
-  #define HAS_NETWORK_CLASSIC_BT ENABLE_CLASSIC_BT
-#else
-  #define HAS_NETWORK_CLASSIC_BT 0
-#endif
-
-#if HAS_NETWORK_CLASSIC_BT
-  #include <BluetoothSerial.h>
-  extern BluetoothSerial SerialBT;
-#endif
 
 #if defined(ESP8266)
 ESP8266WebServer *webServer = nullptr;
@@ -78,11 +65,7 @@ bool apRestartPending = false;
 unsigned long apRestartAtMs = 0;
 bool staConnected = false;
 bool apRunning = false;
-bool tinyWebServerRuntimeEnabled = true;
 bool wifiRuntimeEnabled = true;
-const bool BT_AUTO_WIFI_OFF_ON_CLIENT = false;
-unsigned long btClientConnectedAtMs = 0;
-bool btAutoWifiOffDone = false;
 String wifiModeText = "AP";
 String lastWifiStatus = "AP fallback";
 String startupModeSource = "saved settings";
@@ -101,10 +84,7 @@ extern const char* FW_NAME;
 extern const char* FW_VERSION;
 const uint16_t HTTP_WEB_PORT = 80;
 const uint16_t ALPACA_DISCOVERY_PORT = 32227;
-extern bool bluetoothRuntimeEnabled;
-
 extern String runtimeApSsid();
-extern String runtimeBtName();
 extern bool savePersistentSettings();
 extern bool syncTimeFromNTP(bool forceLog);
 extern void serviceNtpSync();
@@ -193,7 +173,7 @@ void serviceNetworkDuringMountWait() {
     handleAlpacaDiscovery();
   }
 
-#if HAS_NETWORK_CLASSIC_BT
+#if HAS_CLASSIC_BT
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
     delay(1);
     yield();
@@ -269,14 +249,7 @@ void serviceRestart() {
 
   if (restartPending && millis() >= restartAtMs) {
     LOGW("Restarting now to apply network/server configuration");
-#if HAS_NETWORK_CLASSIC_BT
-    if (bluetoothRuntimeEnabled) {
-      SerialBT.disconnect();
-      delay(100);
-      SerialBT.end();
-      delay(250);
-    }
-#endif
+    stopBluetoothService();
     delay(100);
     ESP.restart();
   }
@@ -284,7 +257,7 @@ void serviceRestart() {
 
 void runtimeWifiOff() {
 #if defined(ESP32)
-  tinyWebServerRuntimeEnabled = false;
+  setBluetoothTinyWebRuntimeEnabled(false);
   wifiRuntimeEnabled = false;
 
   if (telnetClient) telnetClient.stop();
@@ -322,7 +295,7 @@ void runtimeWifiOn() {
   }
 
   wifiRuntimeEnabled = true;
-  tinyWebServerRuntimeEnabled = btLiteBootWebEnabled;
+  setBluetoothTinyWebRuntimeEnabled(btLiteBootWebEnabled);
 
   Serial.println("WiFi runtime ON: restoring saved BT WiFi mode...");
   WiFi.persistent(false);
@@ -388,7 +361,7 @@ void applyGpioStartupModeOverride() {
   if (readStartupModePinActive(GPIO_STARTUP_FULL_WIFI_PIN)) {
     bridgeMode = BRIDGE_MODE_WIFI_FULL;
     btLiteBootWebEnabled = true;
-    tinyWebServerRuntimeEnabled = true;
+    setBluetoothTinyWebRuntimeEnabled(true);
     startupModeSource = "GPIO force Full WiFi";
     startupModePinUsed = GPIO_STARTUP_FULL_WIFI_PIN;
     Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> Full WiFi web mode\n", startupModePinUsed);
@@ -398,7 +371,7 @@ void applyGpioStartupModeOverride() {
   if (readStartupModePinActive(GPIO_STARTUP_BT_WEB_PIN)) {
     bridgeMode = BRIDGE_MODE_BT_MIN_WEB;
     btLiteBootWebEnabled = true;
-    tinyWebServerRuntimeEnabled = true;
+    setBluetoothTinyWebRuntimeEnabled(true);
     startupModeSource = "GPIO force BT + web";
     startupModePinUsed = GPIO_STARTUP_BT_WEB_PIN;
     Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> BT + tiny web\n", startupModePinUsed);
@@ -408,7 +381,7 @@ void applyGpioStartupModeOverride() {
   if (readStartupModePinActive(GPIO_STARTUP_BT_TELNET_PIN)) {
     bridgeMode = BRIDGE_MODE_BT_MIN_WEB;
     btLiteBootWebEnabled = false;
-    tinyWebServerRuntimeEnabled = false;
+    setBluetoothTinyWebRuntimeEnabled(false);
     startupModeSource = "GPIO force BT Telnet-only";
     startupModePinUsed = GPIO_STARTUP_BT_TELNET_PIN;
     Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> BT Telnet-only\n", startupModePinUsed);

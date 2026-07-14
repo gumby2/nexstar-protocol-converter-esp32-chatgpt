@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "bluetooth_services.h"
 #include "logging.h"
 #include "position_cache.h"
 #include <math.h>
@@ -62,7 +63,6 @@ unsigned long gotoQueueTimeoutMs = 10000UL;
 unsigned long lastPersistentSaveMs = 0;
 uint32_t persistentSaveCount = 0;
 
-extern bool tinyWebServerRuntimeEnabled;
 extern bool staConnected;
 extern unsigned long nextMountPollDueMs;
 extern unsigned long sanitizeGotoQueueTimeoutMs(unsigned long v);
@@ -168,7 +168,7 @@ bool loadSettingsNVS() {
   apIp = prefs.getString("apIp", apIp);
   staRuntimeDisabled = prefs.getBool("staRunDis", staRuntimeDisabled);
   btLiteBootWebEnabled = prefs.getBool("btWebBoot", btLiteBootWebEnabled);
-  tinyWebServerRuntimeEnabled = btLiteBootWebEnabled;
+  setBluetoothTinyWebRuntimeEnabled(btLiteBootWebEnabled);
 
 #if defined(ESP32)
   ALPACA_PORT = prefs.getUShort("alpaca", ALPACA_PORT);
@@ -641,7 +641,7 @@ bool saveBridgeMode(uint8_t mode) {
 
 bool saveBluetoothLiteWebBootEnabled(bool enabled) {
   btLiteBootWebEnabled = enabled;
-  tinyWebServerRuntimeEnabled = enabled;
+  setBluetoothTinyWebRuntimeEnabled(enabled);
 #if defined(ESP32)
   Preferences prefs;
   if (!prefs.begin("nexstar", false)) {
