@@ -5,6 +5,7 @@
 #include "observer_time.h"
 #include "position_cache.h"
 #include "settings.h"
+#include "slew_controller.h"
 
 #include <math.h>
 
@@ -32,30 +33,7 @@ static const size_t LX200_MAX_CMD_LEN = 96;
 static double lx200TargetRA_deg = 0.0;
 static double lx200TargetDec_deg = 0.0;
 
-extern bool asyncSlewRunning;
-extern bool asyncSlewPending;
-extern bool asyncAltAzSlewPending;
-extern bool asyncNudgePending;
-extern bool asyncRaDecReadPending;
-extern bool asyncAltAzReadPending;
-extern bool gotoCompletionWatchActive;
-extern bool gotoCompletionVerifyPending;
-extern bool lx200GotoUiActive;
-extern uint32_t queuedGotoPositionCacheReplies;
-extern uint32_t nudgeGotoQueueRequests;
-
 void lx200Send(uint8_t source, const String &s);
-bool queuedGotoOrSlewActive();
-void markGotoQueueImmediateAck(const char* protocol, const char* detail);
-void markLX200GotoUiStarted(uint8_t source, const char* detail);
-void handleLX200StopUiRequest(uint8_t source);
-bool mountCommandPathBusy();
-bool enqueueGotoRaDec(double raDeg, double decDeg, uint8_t source, const char* reason);
-bool enqueueGotoAltAz(double altDeg, double azDeg, uint8_t source, const char* reason);
-void clearPendingReadRequestsForLX200Goto(const char* srcName);
-void queueAsyncSlew(double raDeg, double decDeg);
-void queueAsyncAltAzSlew(double altDeg, double azDeg);
-bool hasQueuedGoto();
 bool savePersistentSettings();
 
 double parseLX200RA(String cmd) {
@@ -207,38 +185,6 @@ bool isLX200GotoCommand(const String &cmd) {
   if (c.endsWith("#")) c.remove(c.length() - 1);
   c.toUpperCase();
   return c == ":MS" || c == ":MS0" || c == ":MS1" || c == ":MA" || c == ":MA0" || c == ":MA1";
-}
-
-bool queueRelativeAltAzGoto(double altDelta, double azDelta, uint8_t source, const char* reason) {
-  double alt = 0.0;
-  double az = 0.0;
-  unsigned long ageMs = 0;
-
-  // Application-side nudges must not perform their own Z/E mount reads.
-  // They use the same cached position API used by SkySafari/Stellarium polling.
-  if (!mountPositionApiAltAz(alt, az, &ageMs)) {
-    LOG_MOUNT_W("Nudge-to-GOTO rejected: mount-position API Alt/Az cache is not valid");
-    return false;
-  }
-
-  double newAlt = clampAlt(alt + altDelta);
-  double newAz = normalizeAz(az + azDelta);
-  nudgeGotoQueueRequests++;
-
-  LOG_MOUNT_I("Nudge-to-GOTO request source=%s age=%lu ms: Alt %.6f -> %.6f, Az %.6f -> %.6f",
-              lx200SourceName(source),
-              (unsigned long)ageMs,
-              alt,
-              newAlt,
-              az,
-              newAz);
-
-  if (mountCommandPathBusy()) {
-    return enqueueGotoAltAz(newAlt, newAz, source, reason ? reason : "nudge while mount busy");
-  }
-
-  queueAsyncAltAzSlew(newAlt, newAz);
-  return true;
 }
 
 bool runLX200Nudge(const String &cmd, uint8_t source) {
@@ -436,14 +382,14 @@ void handleLX200Command(const String &rawCmd, uint8_t source) {
     // we are still physically waiting for the original NexStar final '@'.
     // As soon as '@' has arrived, even if post-GOTO E/Z verification is still
     // pending, return a bare # so SkySafari exits Stop mode.
-    bool lx200ReportsSlewing = lx200GotoUiActive && gotoCompletionWatchActive;
+    bool lx200ReportsSlewing = lx200GotoUiIsActive() && gotoCompletionWatchIsActive();
     const char* reply = lx200ReportsSlewing ? "|#" : "#";
     LOG_SKY_D("LX200 %s :D# slew-status reply: %s  uiActive=%s watchActive=%s verifyPending=%s asyncSlewRunning=%s",
               srcName,
               reply,
-              lx200GotoUiActive ? "true" : "false",
-              gotoCompletionWatchActive ? "true" : "false",
-              gotoCompletionVerifyPending ? "true" : "false",
+              lx200GotoUiIsActive() ? "true" : "false",
+              gotoCompletionWatchIsActive() ? "true" : "false",
+              gotoCompletionVerifyIsPending() ? "true" : "false",
               asyncSlewRunning ? "true" : "false");
     lx200Send(source, reply);
     return;

@@ -5,12 +5,9 @@
 #include "observer_time.h"
 #include "position_cache.h"
 #include "settings.h"
+#include "slew_controller.h"
 
 #include <math.h>
-
-extern bool asyncSlewRunning;
-extern unsigned long lastGotoAcceptedMs;
-extern bool lastGotoCommandAccepted;
 
 static int16_t readBE16(const uint8_t* payload) {
   return (int16_t)((payload[0] << 8) | payload[1]);
