@@ -901,6 +901,7 @@ void handleSetModePage() {
   if (ret.length() == 0 || !ret.startsWith("http://")) ret = currentRequestBaseUrl();
 
   if (m == "wifi") {
+    LOG_WEB_I("Explicit WiFi mode action accepted: /setmode mode=wifi");
     saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
     String page;
     page.reserve(900);
@@ -1307,8 +1308,14 @@ void serviceTinySetupServer() {
     return;
   }
 
-  if ((tinyPathOnly == "/mode" && tinyPath.indexOf("radio=wifi") >= 0) ||
-      (tinyPathOnly == "/setmode" && tinyPath.indexOf("mode=wifi") >= 0)) {
+  String tinyModeRadio = tinyQueryParam(req, "radio");
+  tinyModeRadio.toLowerCase();
+  String tinyModeValue = tinyQueryParam(req, "mode");
+  tinyModeValue.toLowerCase();
+
+  if ((tinyPathOnly == "/mode" && tinyModeRadio == "wifi") ||
+      (tinyPathOnly == "/setmode" && tinyModeValue == "wifi")) {
+    LOG_WEB_I("Explicit WiFi mode action accepted: %s", tinyPath.c_str());
     saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
     String ret = tinyQueryParam(req, "return");
     if (!ret.startsWith("http://")) ret = String("http://") + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "/";
@@ -1328,7 +1335,7 @@ void serviceTinySetupServer() {
     return;
   }
 
-  if (tinyPathOnly == "/mode" && tinyPath.indexOf("radio=bt") >= 0) {
+  if (tinyPathOnly == "/mode" && tinyModeRadio == "bt") {
     saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
     tinySetupSendRedirect(c, "/");
     c.stop();
@@ -5034,10 +5041,12 @@ void telnetRunCommand(String line, Print &out) {
   else if (cmd == "wifi off") {
     out.println("WARNING: wifi off will shut down WiFi and disconnect this Telnet session.");
     out.println("Use USB serial or reboot to restore WiFi if needed.");
+    LOG_WIFI_I("Explicit WiFi runtime off accepted: telnet");
     delay(150);
     runtimeWifiOff();
   }
   else if (cmd == "wifi on") {
+    LOG_WIFI_I("Explicit WiFi runtime on accepted: telnet");
     runtimeWifiOn();
     out.println("WiFi runtime restore requested.");
   }
@@ -5045,9 +5054,11 @@ void telnetRunCommand(String line, Print &out) {
     if (wifiRuntimeEnabled) {
       out.println("WARNING: wifi toggle will turn WiFi off and disconnect this Telnet session.");
       out.println("Use USB serial or reboot to restore WiFi if needed.");
+      LOG_WIFI_I("Explicit WiFi runtime off accepted: telnet toggle");
       delay(150);
       runtimeWifiOff();
     } else {
+      LOG_WIFI_I("Explicit WiFi runtime on accepted: telnet toggle");
       runtimeWifiOn();
       out.println("WiFi runtime restore requested.");
     }
@@ -5359,16 +5370,23 @@ void handleConsole() {
   }
 
   else if (cmd == "wifi off") {
+    LOG_WIFI_I("Explicit WiFi runtime off accepted: serial");
     runtimeWifiOff();
   }
 
   else if (cmd == "wifi on") {
+    LOG_WIFI_I("Explicit WiFi runtime on accepted: serial");
     runtimeWifiOn();
   }
 
   else if (cmd == "wifi toggle") {
-    if (wifiRuntimeEnabled) runtimeWifiOff();
-    else runtimeWifiOn();
+    if (wifiRuntimeEnabled) {
+      LOG_WIFI_I("Explicit WiFi runtime off accepted: serial toggle");
+      runtimeWifiOff();
+    } else {
+      LOG_WIFI_I("Explicit WiFi runtime on accepted: serial toggle");
+      runtimeWifiOn();
+    }
   }
 
   else if (cmd == "telnet" || cmd == "telnet status") {
