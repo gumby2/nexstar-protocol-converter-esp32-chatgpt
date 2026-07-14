@@ -1,6 +1,7 @@
 #include "observer_time.h"
 
 #include "logging.h"
+#include "position_cache.h"
 #include "settings.h"
 
 #include <math.h>
@@ -24,15 +25,6 @@ unsigned long lastNtpSyncMs = 0;
 bool ntpSyncValid = false;
 TimeSource currentTimeSource = TIME_SRC_NONE;
 String currentLocationSource = "None";
-
-extern double cachedRA_deg;
-extern double cachedDec_deg;
-extern bool cacheValid;
-extern double cachedAlt_deg;
-extern double cachedAz_deg;
-extern bool altAzCacheValid;
-extern bool altAzComputed;
-extern unsigned long lastComputedCoordMs;
 
 double normalizeRA(double ra) {
   while (ra < 0.0) ra += 360.0;
@@ -254,41 +246,6 @@ bool targetAltitudeFromRaDec(double raDeg, double decDeg, double &altDeg) {
 
 bool targetRaDecFromAltAz(double altDeg, double azDeg, double &raDeg, double &decDeg) {
   return altAzToRaDec(altDeg, azDeg, raDeg, decDeg);
-}
-
-void computeAltAzFromRaDec() {
-  if (!cacheValid || !siteValid || !timeValid) return;
-
-  double altDeg = 0.0;
-  double azDeg = 0.0;
-  if (!raDecToAltAz(cachedRA_deg, cachedDec_deg, altDeg, azDeg)) return;
-
-  cachedAlt_deg = altDeg;
-  cachedAz_deg = azDeg;
-  altAzCacheValid = true;
-  altAzComputed = true;
-  lastComputedCoordMs = millis();
-}
-
-void computeRaDecFromAltAz() {
-  if (!altAzCacheValid || !siteValid || !timeValid) return;
-
-  double ra = 0.0;
-  double dec = 0.0;
-  if (!altAzToRaDec(cachedAlt_deg, cachedAz_deg, ra, dec)) return;
-
-  cachedRA_deg = ra;
-  cachedDec_deg = dec;
-  cacheValid = true;
-  lastComputedCoordMs = millis();
-
-  LOGD("Computed RA/Dec from Alt/Az: RA_deg=%.6f DEC_deg=%.6f RA_hours=%.6f",
-       cachedRA_deg, cachedDec_deg, cachedRA_deg / 15.0);
-}
-
-void invalidateComputedAltAz() {
-  if (altAzComputed) altAzCacheValid = false;
-  altAzComputed = false;
 }
 
 const char* timeSourceName(TimeSource src) {

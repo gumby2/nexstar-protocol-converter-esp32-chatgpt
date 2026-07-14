@@ -3,31 +3,14 @@
 #include "logging.h"
 #include "mount_transport.h"
 #include "observer_time.h"
+#include "position_cache.h"
 #include "settings.h"
 
 #include <math.h>
 
-extern unsigned long lastMountPollMs;
 extern bool asyncSlewRunning;
 extern unsigned long lastGotoAcceptedMs;
 extern bool lastGotoCommandAccepted;
-
-extern double cachedRA_deg;
-extern double cachedDec_deg;
-extern bool cacheValid;
-extern double cachedAlt_deg;
-extern double cachedAz_deg;
-extern bool altAzCacheValid;
-extern bool altAzComputed;
-
-extern double mountCurrentRA_deg;
-extern double mountCurrentDec_deg;
-extern bool mountCurrentRaDecValid;
-extern double mountCurrentAlt_deg;
-extern double mountCurrentAz_deg;
-extern bool mountCurrentAltAzValid;
-extern unsigned long mountCurrentRaDecMs;
-extern unsigned long mountCurrentAltAzMs;
 
 static int16_t readBE16(const uint8_t* payload) {
   return (int16_t)((payload[0] << 8) | payload[1]);
@@ -109,14 +92,7 @@ bool getRaDec(double &ra, double &dec, bool forcePoll) {
       if (ra < 0.0) ra += 360.0;
       ra = normalizeRA(ra);
 
-      cachedRA_deg = ra;
-      cachedDec_deg = dec;
-      cacheValid = true;
-      mountCurrentRA_deg = ra;
-      mountCurrentDec_deg = dec;
-      mountCurrentRaDecValid = true;
-      mountCurrentRaDecMs = millis();
-      lastMountPollMs = millis();
+      updateMountReportedRaDec(ra, dec);
 
       // Do not compute/overwrite current Alt/Az from RA/Dec here.
       // Banner/current Alt/Az must come from the mount Z command only.
@@ -154,14 +130,7 @@ bool getAltAzFromMount(double &alt, double &az) {
       if (az < 0.0) az += 360.0;
       az = normalizeAz(az);
 
-      cachedAlt_deg = alt;
-      cachedAz_deg = az;
-      altAzCacheValid = true;
-      altAzComputed = false;
-      mountCurrentAlt_deg = alt;
-      mountCurrentAz_deg = az;
-      mountCurrentAltAzValid = true;
-      mountCurrentAltAzMs = millis();
+      updateMountReportedAltAz(alt, az);
 
       LOG_MOUNT_I("GET Alt/Az FROM MOUNT OK: ALT_deg=%.6f AZ_deg=%.6f", alt, az);
       ok = true;
@@ -263,7 +232,7 @@ bool gotoRaDecAndWait(double ra, double dec, const char* reasonName) {
       // Do not fake the cache to the requested target. The original NexStar mount
       // must be re-read after '@' so SkySafari sees the actual mount-reported
       // position, not just the requested coordinates.
-      lastMountPollMs = 0;
+      invalidateCachesAfterGoto();
     }
   }
 
@@ -345,7 +314,7 @@ bool gotoAltAzAndWait(double alt, double az, const char* reasonName) {
     ok = waitForNexStarCompletion(name, GOTO_TIMEOUT_MS);
     if (ok) {
       LOG_MOUNT_I("%s complete", name);
-      lastMountPollMs = 0;
+      invalidateCachesAfterGoto();
     }
   }
 

@@ -52,9 +52,6 @@ bool raDecToAltAz(double raDeg, double decDeg, double &altDeg, double &azDeg);
 bool altAzToRaDec(double altDeg, double azDeg, double &raDeg, double &decDeg);
 bool targetAltitudeFromRaDec(double raDeg, double decDeg, double &altDeg);
 bool targetRaDecFromAltAz(double altDeg, double azDeg, double &raDeg, double &decDeg);
-void computeAltAzFromRaDec();
-void computeRaDecFromAltAz();
-void invalidateComputedAltAz();
 
 const char* timeSourceName(TimeSource src);
 void markTimeSource(TimeSource src);

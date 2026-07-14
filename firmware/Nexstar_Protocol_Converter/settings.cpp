@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "logging.h"
+#include "position_cache.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -690,7 +691,7 @@ bool loadBluetoothLitePollInterval() {
 
   if (v > 60000) v = 60000;
   pollIntervalMs = v;
-  nextMountPollDueMs = 0;
+  resetMountPollScheduler();
   LOG_SET_I("BT mount poll interval loaded separately: %lu ms", pollIntervalMs);
   return true;
 #else

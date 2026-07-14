@@ -4,6 +4,7 @@
 #include "mount_transport.h"
 #include "nexstar_protocol.h"
 #include "observer_time.h"
+#include "position_cache.h"
 #include "settings.h"
 #include <math.h>
 #include <stddef.h>
@@ -180,11 +181,6 @@ bool approxIpLocationValid = false;
 BluetoothSerial SerialBT;
 #endif
 
-unsigned long lastMountPollMs = 0;
-unsigned long lastComputedCoordMs = 0;
-unsigned long lastPositionDemandMs = 0;
-const unsigned long POSITION_DEMAND_ACTIVE_MS = 15000;
-
 const char* currentWebRequestPath = "";
 
 
@@ -250,48 +246,10 @@ const unsigned long SKYSAFARI_RECENT_GUARD_MS = 90000;
 const unsigned long SKYSAFARI_BT_TRAFFIC_GUARD_MS = 250;
 const unsigned long SKYSAFARI_BT_COMMAND_POLL_QUIET_MS = 1500;
 bool lastGotoCommandAccepted = false;
-const uint8_t BACKGROUND_POLL_FAIL_LIMIT = 3;
-bool backgroundPollingAutoDisabled = false;
 unsigned long lastLoopTimeMs = 0;
 unsigned long maxLoopTimeMs = 0;
 unsigned long lastLoopLatencyMs = 0;
 unsigned long maxLoopLatencyMs = 0;
-unsigned long lastPollSchedulerLatencyMs = 0;
-unsigned long maxPollSchedulerLatencyMs = 0;
-unsigned long nextMountPollDueMs = 0;
-unsigned long mountPollsStarted = 0;
-unsigned long mountPollsDeferredBusy = 0;
-unsigned long mountPollsMissedDeadline = 0;
-unsigned long mountPollsSucceeded = 0;
-unsigned long firstSuccessfulMountPollMs = 0;
-unsigned long lastSuccessfulMountPollMs = 0;
-int lastSuccessfulMountPollYear = 0;
-int lastSuccessfulMountPollMonth = 0;
-int lastSuccessfulMountPollDay = 0;
-int lastSuccessfulMountPollHour = 0;
-int lastSuccessfulMountPollMinute = 0;
-int lastSuccessfulMountPollSecond = 0;
-
-double cachedRA_deg = 0.0;
-double cachedDec_deg = 0.0;
-bool cacheValid = false;
-
-double cachedAlt_deg = 0.0;
-double cachedAz_deg = 0.0;
-bool altAzCacheValid = false;
-bool altAzComputed = false;
-
-// Banner/current-position values. These are written ONLY by successful mount
-// position reads: E for RA/Dec and Z for Alt/Az. Target slews, safety math,
-// and coordinate conversions must never write these.
-double mountCurrentRA_deg = 0.0;
-double mountCurrentDec_deg = 0.0;
-bool mountCurrentRaDecValid = false;
-double mountCurrentAlt_deg = 0.0;
-double mountCurrentAz_deg = 0.0;
-bool mountCurrentAltAzValid = false;
-unsigned long mountCurrentRaDecMs = 0;
-unsigned long mountCurrentAltAzMs = 0;
 
 double targetRA_deg = 0.0;
 double targetDec_deg = 0.0;
@@ -333,7 +291,6 @@ void handleStellariumServer();
 void handleBluetoothLX200();
 void serviceGotoCompletionWatch();
 void serviceGotoQueue();
-void serviceMountPolling();
 void startFallbackAP();
 
 // Full WiFi log lines are mirrored to serial by addLogLine().
@@ -441,47 +398,7 @@ void lx200Send(uint8_t source, const String &s) {
 #endif
 }
 
-bool mountPositionApiRaDec(double &raDeg, double &decDeg, unsigned long *ageMs = nullptr) {
-  if (!mountCurrentRaDecValid) {
-    positionApiCacheMisses++;
-    return false;
-  }
-  raDeg = mountCurrentRA_deg;
-  decDeg = mountCurrentDec_deg;
-  if (ageMs) *ageMs = millis() - mountCurrentRaDecMs;
-  positionApiCacheReplies++;
-  return true;
-}
-
-bool mountPositionApiAltAz(double &altDeg, double &azDeg, unsigned long *ageMs = nullptr) {
-  if (!mountCurrentAltAzValid) {
-    positionApiCacheMisses++;
-    return false;
-  }
-  altDeg = mountCurrentAlt_deg;
-  azDeg = mountCurrentAz_deg;
-  if (ageMs) *ageMs = millis() - mountCurrentAltAzMs;
-  positionApiCacheReplies++;
-  return true;
-}
-
-bool mountPositionApiHasRaDec() {
-  return mountCurrentRaDecValid;
-}
-
-bool mountPositionApiHasAltAz() {
-  return mountCurrentAltAzValid;
-}
-
-void markPositionDemand(const char* reason = nullptr) {
-  lastPositionDemandMs = millis();
-  if (nextMountPollDueMs == 0 || !mountCurrentRaDecValid) nextMountPollDueMs = lastPositionDemandMs;
-  if (reason) LOG_MOUNT_T("Position demand active: %s", reason);
-}
-
-bool positionDemandActive() {
-  unsigned long nowMs = millis();
-  if (lastPositionDemandMs && nowMs - lastPositionDemandMs < POSITION_DEMAND_ACTIVE_MS) return true;
+bool positionDemandClientConnected() {
   if (bridgeMode == BRIDGE_MODE_WIFI_FULL) {
     if (lx200Client && lx200Client.connected()) return true;
     if (stellariumClientConnected) return true;
@@ -492,10 +409,10 @@ bool positionDemandActive() {
   return false;
 }
 
-unsigned long effectiveMountPollIntervalMs() {
-  if (!timeValid) return 0;
-  if (positionDemandActive()) return pollIntervalMs;
-  return idlePollIntervalMs;
+bool mountPollingBlocked() {
+  return asyncSlewRunning || asyncSlewPending || asyncAltAzSlewPending ||
+         asyncNudgePending || asyncRaDecReadPending || asyncAltAzReadPending ||
+         gotoCompletionWatchActive || gotoCompletionVerifyPending;
 }
 
 bool routeLX200SourceThroughCommonMountCore(uint8_t source) {
@@ -1008,8 +925,8 @@ void handleBluetoothLX200() {
     lx200BtLastUnhandled = "";
     lx200BtGotoStageCommands = 0;
     lx200BtPollOnlyHintCount = 0;
-    backgroundPollFailCount = 0;
-    lastMountPollMs = 0;
+    resetMountPollFailures();
+    invalidateCachesAfterGoto();
   } else if (!nowConnected && lx200BtClientConnected) {
     LOG_BT_I("Bluetooth LX200/SkySafari client disconnected");
     btClientConnectedAtMs = 0;
@@ -1022,84 +939,6 @@ void handleBluetoothLX200() {
   // per loop pass through the same shared LX200-to-mount command core used by WiFi.
   routeLX200SourceThroughCommonMountCore(LX_SRC_BT);
 #endif
-}
-
-void serviceMountPolling() {
-  // Top-priority independent mount poller:
-  // - Runs from loop() before lower-priority network/UI/console services.
-  // - Timing is controlled only by pollIntervalMs and a fixed next-due scheduler.
-  // - Not gated by WiFi clients, Bluetooth clients, SkySafari recent traffic,
-  //   status page refreshes, post-GOTO fast windows, or protocol activity.
-  // - Still respects the original NexStar single-command rule by never polling
-  //   while a mount transaction, slew, GOTO completion watch, or async command is active.
-  unsigned long activePollMs = effectiveMountPollIntervalMs();
-  if (activePollMs == 0) {
-    nextMountPollDueMs = 0;
-    return;
-  }
-
-  if (!timeValid) {
-    nextMountPollDueMs = 0;
-    return;
-  }
-
-  unsigned long nowMs = millis();
-  if (nextMountPollDueMs == 0) {
-    nextMountPollDueMs = nowMs + activePollMs;
-    return;
-  }
-
-  if ((long)(nowMs - nextMountPollDueMs) < 0) return;
-
-  if (mountBusy || asyncSlewRunning || asyncSlewPending || asyncAltAzSlewPending ||
-      asyncNudgePending || asyncRaDecReadPending || asyncAltAzReadPending ||
-      gotoCompletionWatchActive || gotoCompletionVerifyPending) {
-    mountPollsDeferredBusy++;
-    return;
-  }
-
-  lastPollSchedulerLatencyMs = nowMs - nextMountPollDueMs;
-  if (lastPollSchedulerLatencyMs > maxPollSchedulerLatencyMs) maxPollSchedulerLatencyMs = lastPollSchedulerLatencyMs;
-  if (lastPollSchedulerLatencyMs > activePollMs) mountPollsMissedDeadline++;
-  mountPollsStarted++;
-
-  // Background polling reads RA/Dec only; Alt/Az is computed locally from the
-  // current site/time to reduce NexStar serial traffic.
-  LOG_MOUNT_D("Top-priority mount poll due: interval=%lu ms latency=%lu ms; querying actual mount RA/Dec with E",
-              activePollMs, lastPollSchedulerLatencyMs);
-
-  double ra = 0.0;
-  double dec = 0.0;
-
-  bool gotRaDec = getRaDec(ra, dec, true);
-  unsigned long finishMs = millis();
-  lastMountPollMs = finishMs;
-  if (gotRaDec) {
-    markSuccessfulMountPoll(finishMs);
-    computeAltAzFromRaDec();
-  }
-
-  // Keep the poll cadence tied to the fixed scheduler instead of drifting by
-  // loop workload or mount command duration. If the code falls behind, skip to
-  // the next future slot instead of doing a burst of back-to-back E/Z queries.
-  nextMountPollDueMs += activePollMs;
-  while ((long)(finishMs - nextMountPollDueMs) >= 0) {
-    nextMountPollDueMs += activePollMs;
-    mountPollsMissedDeadline++;
-  }
-
-  if (gotRaDec) {
-    backgroundPollFailCount = 0;
-  } else {
-    backgroundPollFailCount++;
-    if (backgroundPollFailCount < BACKGROUND_POLL_FAIL_LIMIT) {
-      LOG_MOUNT_D("Top-priority mount poll failed count=%lu; polling remains enabled",
-                  (unsigned long)backgroundPollFailCount);
-    } else {
-      LOG_MOUNT_W("Top-priority mount poll failed count=%lu; polling remains enabled",
-                  (unsigned long)backgroundPollFailCount);
-    }
-  }
 }
 
 String jsonEscape(const String &s) {
@@ -1330,14 +1169,6 @@ String formatSuccessfulMountPollSpan() {
 
 String formatMountUptime() {
   return formatSuccessfulMountPollSpan();
-}
-
-void markSuccessfulMountPoll(unsigned long pollMs) {
-  mountPollsSucceeded++;
-  if (firstSuccessfulMountPollMs == 0) firstSuccessfulMountPollMs = pollMs;
-  lastSuccessfulMountPollMs = pollMs;
-  currentLocalParts(lastSuccessfulMountPollYear, lastSuccessfulMountPollMonth, lastSuccessfulMountPollDay,
-                    lastSuccessfulMountPollHour, lastSuccessfulMountPollMinute, lastSuccessfulMountPollSecond);
 }
 
 String formatHmsFromHours(double hours, int decimals = 1) {
@@ -2329,8 +2160,7 @@ void serviceTinySetupServer() {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     pollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
-    backgroundPollingAutoDisabled = false;
+    resetMountPollScheduler();
     bool saved = saveBluetoothLitePollInterval(pollIntervalMs);
 
     tinySetupSendRedirect(c, "/");
@@ -2478,8 +2308,7 @@ void handleSetBtPollPage() {
   if (p < 0) p = 0;
   if (p > 60000) p = 60000;
   pollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
-  backgroundPollingAutoDisabled = false;
+  resetMountPollScheduler();
   bool saved = savePersistentSettings();
 
   String msg = String("Mount poll interval set to ") + String(pollIntervalMs) + " ms";
@@ -3062,16 +2891,15 @@ void handleSetSiteTimePage() {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     pollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
-    backgroundPollingAutoDisabled = false;
-    backgroundPollFailCount = 0;
+    resetMountPollScheduler();
+    resetMountPollFailures();
   }
   if (server.hasArg("idlepoll")) {
     long p = server.arg("idlepoll").toInt();
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     idlePollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
   }
 
   if (server.hasArg("throttle")) {
@@ -3123,16 +2951,15 @@ void handleSetManualSiteTimePage() {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     pollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
-    backgroundPollingAutoDisabled = false;
-    backgroundPollFailCount = 0;
+    resetMountPollScheduler();
+    resetMountPollFailures();
   }
   if (server.hasArg("idlepoll")) {
     long p = server.arg("idlepoll").toInt();
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     idlePollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
   }
   if (server.hasArg("throttle")) {
     long t = server.arg("throttle").toInt();
@@ -3197,16 +3024,15 @@ void handleSetDeviceSiteTimePage() {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     pollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
-    backgroundPollingAutoDisabled = false;
-    backgroundPollFailCount = 0;
+    resetMountPollScheduler();
+    resetMountPollFailures();
   }
   if (server.hasArg("idlepoll")) {
     long p = server.arg("idlepoll").toInt();
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     idlePollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
   }
 
   if (server.hasArg("throttle")) {
@@ -5847,8 +5673,7 @@ bool setMountPollValue(long valueMs) {
   if (valueMs < 0) valueMs = 0;
   if (valueMs > 60000) valueMs = 60000;
   pollIntervalMs = (unsigned long)valueMs;
-  nextMountPollDueMs = 0;
-  backgroundPollingAutoDisabled = false;
+  resetMountPollScheduler();
   return savePersistentSettings();
 }
 
@@ -6350,7 +6175,7 @@ void telnetRunCommand(String line, Print &out) {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     idlePollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
     bool ok = savePersistentSettings();
     out.printf("Idle poll interval set to %lu ms saved=%d\n", idlePollIntervalMs, ok ? 1 : 0);
   }
@@ -6925,7 +6750,7 @@ void handleConsole() {
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     idlePollIntervalMs = (unsigned long)p;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
     bool ok = savePersistentSettings();
     Serial.printf("Idle poll interval set to %lu ms saved=%d\n", idlePollIntervalMs, ok ? 1 : 0);
   }
@@ -6966,13 +6791,7 @@ void serviceGotoCompletionWatch() {
         // so SkySafari immediately sees coordinates near the requested target.
         // The real mount-reported E/Z verification below will overwrite this
         // estimate as soon as it succeeds.
-        cachedRA_deg = normalizeRA(gotoCompletionTargetRA_deg);
-        cachedDec_deg = gotoCompletionTargetDec_deg;
-        cacheValid = true;
-        mountCurrentRA_deg = cachedRA_deg;
-        mountCurrentDec_deg = cachedDec_deg;
-        mountCurrentRaDecValid = true;
-        mountCurrentRaDecMs = nowMs;
+        primeGotoCompletionRaDec(gotoCompletionTargetRA_deg, gotoCompletionTargetDec_deg, nowMs);
         LOG_MOUNT_I("SkySafari app-facing RA/Dec cache primed at GOTO completion: RA=%.6f Dec=%.6f until E/Z verification",
                     cachedRA_deg, cachedDec_deg);
 
@@ -7030,7 +6849,7 @@ void serviceGotoCompletionWatch() {
     }
 
     asyncSlewRunning = false;
-    lastMountPollMs = millis();
+    markMountPollTimestamp();
     LOG_MOUNT_I("Post-GOTO verification finished");
   }
 }
@@ -7071,7 +6890,7 @@ void serviceAsyncSlew() {
     asyncNudgePending = false;
     if (nudgeRelativeAltAz(pendingNudgeAltDelta, pendingNudgeAzDelta)) {
       LOGI("Queued nudge converted to Alt/Az GOTO request");
-      lastMountPollMs = 0;
+      invalidateCachesAfterGoto();
     } else {
       LOGW("Queued nudge failed");
     }
@@ -7106,7 +6925,7 @@ void serviceAsyncSlew() {
     asyncAltAzSlewPending = false;
     if (gotoAltAz(pendingAlt_deg, pendingAz_deg)) {
       LOGI("Queued Alt/Az slew accepted; pausing mount polls while SkySafari stays responsive");
-      lastMountPollMs = millis();
+      markMountPollTimestamp();
     }
     return;
   }
@@ -7513,7 +7332,7 @@ delay(500);
   }
   if (ESP32_BOOT_DISABLE_BACKGROUND_POLLING) {
     pollIntervalMs = 0;
-    nextMountPollDueMs = 0;
+    resetMountPollScheduler();
     Serial.println("[BOOT] ESP32 background mount polling disabled at boot");
   }
   if (!ESP32_BOOT_DISABLE_BACKGROUND_POLLING) {
@@ -7547,9 +7366,8 @@ delay(500);
     ntpEnabled = false;
     loadBluetoothLitePollInterval();
     if (pollIntervalMs > 60000) pollIntervalMs = 2000;
-    nextMountPollDueMs = 0;
-    backgroundPollingAutoDisabled = false;
-    backgroundPollFailCount = 0;
+    resetMountPollScheduler();
+    resetMountPollFailures();
 #if defined(ESP32)
     loadWiFiConfig(); // use saved STA/AP settings in exclusive STA-only or AP-only mode, but do not start the full WebServer.h UI
     WiFi.persistent(false);

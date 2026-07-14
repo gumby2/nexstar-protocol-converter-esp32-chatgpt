@@ -3,6 +3,7 @@
 #include "logging.h"
 #include "nexstar_protocol.h"
 #include "observer_time.h"
+#include "position_cache.h"
 #include "settings.h"
 
 #include <math.h>
@@ -44,9 +45,6 @@ extern uint32_t queuedGotoPositionCacheReplies;
 extern uint32_t nudgeGotoQueueRequests;
 
 void lx200Send(uint8_t source, const String &s);
-bool mountPositionApiRaDec(double &raDeg, double &decDeg, unsigned long *ageMs);
-bool mountPositionApiAltAz(double &altDeg, double &azDeg, unsigned long *ageMs);
-void markPositionDemand(const char* reason);
 bool queuedGotoOrSlewActive();
 void markGotoQueueImmediateAck(const char* protocol, const char* detail);
 void markLX200GotoUiStarted(uint8_t source, const char* detail);

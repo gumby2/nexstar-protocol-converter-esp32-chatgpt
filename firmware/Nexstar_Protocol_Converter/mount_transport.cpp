@@ -42,7 +42,6 @@ unsigned long lastMountFaultMs = 0;
 bool mountCommFault = false;
 String lastMountFault = "No mount communication yet";
 bool mountBusy = false;
-uint8_t backgroundPollFailCount = 0;
 bool suppressNextMountFault = false;
 
 void serviceNetworkDuringMountWait();
