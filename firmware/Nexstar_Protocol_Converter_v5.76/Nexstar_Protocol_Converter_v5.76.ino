@@ -49,7 +49,7 @@ const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
 
-const char* FW_VERSION = "v5.81";
+const char* FW_VERSION = "v5.82";
 const char* FW_NAME = "NexStar Protocol Converter";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
@@ -2711,6 +2711,10 @@ String telnetMaskedPassword() {
   return String("(set, ") + String(telnetPassword.length()) + " chars)";
 }
 
+bool telnetFullUiAllowed() {
+  return bridgeMode == BRIDGE_MODE_WIFI_FULL;
+}
+
 void telnetPrintHelp(Print &out) {
   out.println();
   out.printf("%s %s commands\n", FW_NAME, FW_VERSION);
@@ -2739,7 +2743,11 @@ void telnetPrintHelp(Print &out) {
   out.println("  apdefault");
   out.println("  setsta <ssid> <password>");
   out.println("  log | log 0..5 [systems]");
-  out.println("Disabled in Telnet v5.74: menu/ui, monitor, tasks, telnetlog.");
+  if (telnetFullUiAllowed()) {
+    out.println("Full Telnet UI: menu | monitor [s|ms] | tasks [s|ms] | telnetlog [0|1]");
+  } else {
+    out.println("BT Telnet mode: menu/ui, monitor, tasks, and telnetlog are disabled.");
+  }
 }
 
 void telnetPrintStatus(Print &out) {
@@ -2986,7 +2994,14 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  Show counters, latency, memory, uptime, and errors.");
     } else if (topic == "tasks") {
       out.println("tasks");
-      out.println("  Telnet FreeRTOS task screen is disabled in v5.74.");
+      if (telnetFullUiAllowed()) {
+        out.println("tasks [seconds|millisecondsms]");
+        out.println("  Show FreeRTOS cumulative per-task runtime stats in place.");
+        out.println("  Default refresh is 5 seconds. Examples: tasks | tasks 10 | tasks 1500ms");
+        out.println("  Press q, Enter, or Ctrl-C to exit.");
+      } else {
+        out.println("  Telnet FreeRTOS task screen is disabled in BT Telnet mode.");
+      }
     } else if (topic == "gpio" || topic == "gpio_startup" || topic == "gpiostartup" || topic == "startup_pins") {
       out.println("gpio_startup | gpiostartup | startup_pins");
       out.println("  Show startup mode-pin readings and boot-mode source.");
@@ -2998,10 +3013,25 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  These commands do not change WiFi state.");
     } else if (topic == "monitor") {
       out.println("monitor");
-      out.println("  Telnet monitor screen is disabled in v5.74; use status.");
+      if (telnetFullUiAllowed()) {
+        out.println("monitor [seconds|millisecondsms]");
+        out.println("  Start a live in-place Telnet status view. Default refresh is 2 seconds.");
+        out.println("  Examples: monitor | monitor 5 | monitor 750ms");
+        out.println("  Press q, Enter, or Ctrl-C to exit.");
+      } else {
+        out.println("  Telnet monitor screen is disabled in BT Telnet mode; use status.");
+      }
     } else if (topic == "telnetlog") {
       out.println("telnetlog");
-      out.println("  Telnet live logging is disabled in v5.74.");
+      if (telnetFullUiAllowed()) {
+        out.println("  Show whether log lines are streamed to the Telnet terminal.");
+        out.println("telnetlog 0");
+        out.println("  Turn off log streaming to the Telnet terminal.");
+        out.println("telnetlog 1");
+        out.println("  Turn on log streaming to the Telnet terminal.");
+      } else {
+        out.println("  Telnet live logging is disabled in BT Telnet mode.");
+      }
     } else if (topic == "idlepoll") {
       out.println("idlepoll | poll idle");
       out.println("  Show idle poll interval and effective poll interval.");
@@ -3022,20 +3052,41 @@ void telnetRunCommand(String line, Print &out) {
     }
   }
   else if (cmd == "menu" || cmd == "ui") {
-    out.println("ANSI Telnet menu is disabled in v5.74; use plain commands.");
+    if (telnetFullUiAllowed()) telnetStartMenu(out);
+    else out.println("ANSI Telnet menu is disabled in BT Telnet mode; use plain commands.");
   }
   else if (cmd == "menu size" || cmd == "ui size") {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      out.printf("Telnet menu size: %u cols x %u rows%s\n",
+                 telnetGetMenuTerminalColumns(),
+                 telnetGetMenuTerminalRows(),
+                 telnetMenuSizeFromNaws() ? " (NAWS)" : " (manual/default)");
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd.startsWith("menu rows ") || cmd.startsWith("ui rows ")) {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      int sp = cmd.lastIndexOf(' ');
+      telnetSetMenuTerminalSize(telnetGetMenuTerminalColumns(), (uint16_t)cmd.substring(sp + 1).toInt());
+      out.printf("Telnet menu rows: %u\n", telnetGetMenuTerminalRows());
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd.startsWith("menu cols ") || cmd.startsWith("ui cols ")) {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      int sp = cmd.lastIndexOf(' ');
+      telnetSetMenuTerminalSize((uint16_t)cmd.substring(sp + 1).toInt(), telnetGetMenuTerminalRows());
+      out.printf("Telnet menu columns: %u\n", telnetGetMenuTerminalColumns());
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "status") telnetPrintStatus(out);
   else if (cmd == "monitor" || cmd.startsWith("monitor ")) {
-    out.println("Telnet monitor screen is disabled in v5.74; use status.");
+    if (telnetFullUiAllowed()) telnetStartMonitor(out, parseMonitorRefreshMs(cmd));
+    else out.println("Telnet monitor screen is disabled in BT Telnet mode; use status.");
   }
   else if (cmd == "gpio_startup" || cmd == "gpiostartup" || cmd == "startup_pins") {
     out.print(gpioStartupModeText());
@@ -3051,18 +3102,36 @@ void telnetRunCommand(String line, Print &out) {
     printConsoleHealth(out);
   }
   else if (cmd == "tasks" || cmd.startsWith("tasks ")) {
-    out.println("Telnet FreeRTOS task screen is disabled in v5.74.");
+    if (telnetFullUiAllowed()) telnetStartTasks(out, parseIntervalArgumentMs(cmd, "tasks", 5000UL));
+    else out.println("Telnet FreeRTOS task screen is disabled in BT Telnet mode.");
   }
   else if (cmd == "telnetlog") {
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      out.printf("Telnet live logs: %s lines=%lu\n",
+                 telnetLiveLogEnabled ? "enabled" : "disabled",
+                 (unsigned long)telnetLiveLogLines);
+      out.println("Commands: telnetlog 0 | telnetlog 1");
+    } else {
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnetlog 0") {
-    telnetLiveLogEnabled = false;
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logs disabled.");
+    } else {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnetlog 1") {
-    telnetLiveLogEnabled = false;
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      telnetLiveLogEnabled = true;
+      out.println("Telnet live logs enabled.");
+    } else {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnet" || cmd == "telnet status") {
     printTelnetRuntimeStatus(out);
@@ -3252,17 +3321,17 @@ void telnetRunCommand(String line, Print &out) {
     out.println("Saved full WiFi web mode; restarting soon.");
   }
   else if (cmd == "telnetlog") {
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "telnetlog 0") {
     telnetLiveLogEnabled = false;
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "telnetlog 1") {
     telnetLiveLogEnabled = false;
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "reboot" || cmd == "restart") {
