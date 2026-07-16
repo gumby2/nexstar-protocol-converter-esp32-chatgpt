@@ -49,7 +49,7 @@ const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
 
-const char* FW_VERSION = "v5.82";
+const char* FW_VERSION = "v5.86";
 const char* FW_NAME = "NexStar Protocol Converter";
 
 // Stability defaults: preserve all features, but avoid surprise background load.

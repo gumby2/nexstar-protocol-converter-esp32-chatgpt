@@ -109,8 +109,6 @@ static unsigned long telnetMenuLastPageRefreshMs = 0;
 // Menu-owned status/information auto-refresh. Disabled by default for
 // stability. It can be enabled from Setup at conservative intervals.
 static unsigned long telnetMenuAutoRefreshMs = 0UL;
-// Mirrors the web Status page Basic/Advanced toggle.
-static bool telnetStatusAdvanced = false;
 static const uint8_t TELNET_BANNER_ROWS = 5;
 static char telnetBannerCache[TELNET_BANNER_ROWS][160] = {{0}};
 static const unsigned long TELNET_KEEPALIVE_MS = 60000UL;
@@ -190,6 +188,9 @@ extern void telnetStopTasks(Print &out);
 extern void telnetExecuteCommand(String line, Print &out);
 extern void telnetStartMenu(Print &out);
 extern void telnetStopMenu(Print &out);
+extern String basicStatusText();
+extern String basicSystemHealthText();
+extern String systemHealthText();
 extern String sampleWebCpuLoadText();
 extern String sampleBannerSystemText();
 extern String currentTimezoneAbbrev();
@@ -1099,8 +1100,7 @@ enum TelnetMenuControlKind : uint8_t {
 static TelnetMenuControlKind menuControlKind(uint8_t screen, uint8_t index) {
   if (screen == 0) return index < 5 ? TM_CONTROL_SUBMENU : TM_CONTROL_ACTION;
   if (screen == 2) {
-    if (index == 0) return TM_CONTROL_CHECKBOX;
-    if (index == 7) return TM_CONTROL_BACK;
+    if (index == 8) return TM_CONTROL_BACK;
     return TM_CONTROL_ACTION;
   }
   if (screen == 3) {
@@ -1139,16 +1139,17 @@ static uint8_t parentScreen(uint8_t screen){ if(screen==6)return 1; if(screen>=1
 static const char *menuLabel(uint8_t screen, uint8_t index) {
   static const char *main[] = {"Control", "Status", "Setup", "Logs", "Advanced", "Exit to Telnet prompt"};
   static const char *control[] = {"Read RA/Dec", "Read Alt/Az", "Manual Nudge", "Mount initialization test", "Drain mount input", "Back"};
-  static const char *status[] = {"Advanced status", "Observer Status", "System Health", "Network Status", "Time / Location", "Protocols / Ports", "FreeRTOS Tasks", "Back"};
-  static const char *setup[] = {"Mount poll interval", "Idle poll interval", "Status auto-refresh interval", "Telnet live logging", "Switch to Full WiFi mode", "Back"};
+  static const char *status[] = {"Observer Status - Basic", "System Health - Basic", "Observer Status - Advanced", "System Health - Advanced", "Network Status", "Time / Location", "Protocols / Ports", "FreeRTOS Tasks", "Back"};
+  static const char *setup[] = {"Mount poll interval", "Idle poll interval", "Status auto-refresh interval", "Telnet live logging", "", "Back"};
   static const char *logs[] = {"Errors only", "Warnings", "Information", "Debug", "Trace", "Toggle live Telnet logs", "Back"};
   static const char *adv[] = {"GPIO startup pins", "Telnet status", "Restart controller", "Restore AP defaults", "Back"};
   static const char *nudge[] = {"Azimuth +", "Azimuth -", "Altitude +", "Altitude -", "Back"};
   const char **a=nullptr; uint8_t n=0;
-  switch(screen){case 0:a=main;n=6;break;case 1:a=control;n=6;break;case 2:a=status;n=8;break;case 3:a=setup;n=6;break;case 4:a=logs;n=7;break;case 5:a=adv;n=5;break;case 6:a=nudge;n=5;break;}
+  switch(screen){case 0:a=main;n=6;break;case 1:a=control;n=6;break;case 2:a=status;n=9;break;case 3:a=setup;n=6;break;case 4:a=logs;n=7;break;case 5:a=adv;n=5;break;case 6:a=nudge;n=5;break;}
+  if(screen==3 && index==4) return bridgeMode==BRIDGE_MODE_WIFI_FULL ? "Switch to BT Telnet mode" : "Switch to Full WiFi mode";
   return (a && index<n)?a[index]:"";
 }
-static uint8_t menuCount(uint8_t screen) { switch(screen){case 0:return 6;case 1:return 6;case 2:return 8;case 3:return 6;case 4:return 7;case 5:return 5;case 6:return 5;default:return 0;} }
+static uint8_t menuCount(uint8_t screen) { switch(screen){case 0:return 6;case 1:return 6;case 2:return 9;case 3:return 6;case 4:return 7;case 5:return 5;case 6:return 5;default:return 0;} }
 
 static void drawBorder(Print &out,uint16_t row,const char *left,const char *fill,const char *right){vtCursor(out,row,1);out.print(left);for(uint16_t i=0;i<uiWidth()-2;i++)out.print(fill);out.print(right);}
 static void breadcrumb(char *buf,size_t size){
@@ -1347,7 +1348,7 @@ static void drawHeader(Print &out) {
 static void drawFooter(Print &out, const char *message=nullptr) {
   uint16_t h=uiHeight(),w=uiWidth(); vtResetScroll(out); drawBorder(out,h-2,gML(),gSH(),gMR());
   const char *hint;
-  if(telnetMenuScreen==8) hint=telnetMenuPageRefreshable ? "R/Enter Refresh  Space/N Next  P Previous  Left/q Back  ? Help" : "Space/N Next  P Previous  Left/q Back  ? Help";
+  if(telnetMenuScreen==8) hint=telnetMenuPageRefreshable ? "Up/Down Scroll  r Refresh  Enter Refresh  Space/N Page  P Previous  Left/q Back" : "Up/Down Scroll  Space/N Page  P Previous  Left/q Back";
   else if(telnetMenuScreen==7) hint="Y Confirm  N/Esc/Left Cancel";
   else if(telnetMenuFocus==1) hint="Tab/Shift-Tab Focus  Enter/Space Reboot  q Back  ? Help";
   else if(telnetMenuFocus==2) hint="Tab/Shift-Tab Focus  Enter/Space Switch Mode  q Back  ? Help";
@@ -1363,9 +1364,6 @@ static void drawFooter(Print &out, const char *message=nullptr) {
 static void drawRow(Print &out,uint8_t index,bool selected,bool clearLine=true) {
   uint16_t row=uiContentTop()+index; if(row>uiContentBottom()) return; vtCursor(out,row,1); if(clearLine)vtClearLine(out); out.print(gSV()); if(selected)vtSelected(out);
   char value[40]="";
-  if(telnetMenuScreen==2 && index==0){
-    snprintf(value,sizeof(value),"[%c]",telnetStatusAdvanced?'X':' ');
-  }
   if(telnetMenuScreen==3){
     if(index==0)snprintf(value,sizeof(value),"%lu ms",pollIntervalMs);
     else if(index==1)snprintf(value,sizeof(value),"%lu ms",idlePollIntervalMs);
@@ -1423,7 +1421,40 @@ static size_t previousPage(size_t start,uint16_t lines){
   }
   return previous;
 }
-static void drawOutput(Print &out, bool clearPage=false){vtHideCursor(out);if(clearPage)vtClear(out);drawHeader(out);if(!clearPage)clearContent(out);uint16_t lines=uiContentRows();size_t end=pageEnd(telnetMenuPageStart,lines);uint16_t row=uiContentTop();for(size_t i=telnetMenuPageStart;i<end&&row<=uiContentBottom();){vtCursor(out,row++,1);if(!clearPage)vtClearLine(out);out.print(gSV());char buf[192];size_t j=0;while(i<end&&telnetMenuPageBuffer[i]!='\n'&&j<sizeof(buf)-1)buf[j++]=telnetMenuPageBuffer[i++];while(i<end&&telnetMenuPageBuffer[i]!='\n')i++;if(i<end&&telnetMenuPageBuffer[i]=='\n')i++;buf[j]=0;out.printf("%-*.*s",(int)(uiWidth()-2),(int)(uiWidth()-2),buf);out.print(gSV());}char foot[120];bool more=end<telnetMenuPageLength;snprintf(foot,sizeof(foot),"Page %u  %s%s",(unsigned)(telnetMenuPageNumber+1),telnetMenuPageStart?gUp():"",more?gDn():"");drawFooter(out,foot);}
+static size_t outputWindowEndIn(const char *buffer,size_t length,size_t start,uint16_t lines){
+  size_t p=start;
+  uint16_t n=0;
+  while(p<length&&n<lines){
+    if(buffer[p++]=='\n')n++;
+  }
+  if(p>=length)return length;
+  return p;
+}
+static size_t outputWindowEnd(size_t start,uint16_t lines){
+  return outputWindowEndIn(telnetMenuPageBuffer,telnetMenuPageLength,start,lines);
+}
+static size_t nextLineStart(size_t start){
+  size_t p=start;
+  while(p<telnetMenuPageLength&&telnetMenuPageBuffer[p]!='\n')p++;
+  if(p<telnetMenuPageLength&&telnetMenuPageBuffer[p]=='\n')p++;
+  return p;
+}
+static size_t previousLineStart(size_t start){
+  if(!start)return 0;
+  size_t prev=0,p=0;
+  while(p<start){
+    prev=p;
+    while(p<start&&telnetMenuPageBuffer[p]!='\n')p++;
+    if(p<start&&telnetMenuPageBuffer[p]=='\n')p++;
+  }
+  return prev;
+}
+static uint16_t outputLineNumber(size_t start){
+  uint16_t line=1;
+  for(size_t p=0;p<start&&p<telnetMenuPageLength;p++)if(telnetMenuPageBuffer[p]=='\n')line++;
+  return line;
+}
+static void drawOutput(Print &out, bool clearPage=false){vtHideCursor(out);if(clearPage)vtClear(out);drawHeader(out);if(!clearPage)clearContent(out);uint16_t lines=uiContentRows();size_t end=outputWindowEnd(telnetMenuPageStart,lines);uint16_t row=uiContentTop();for(size_t i=telnetMenuPageStart;i<end&&row<=uiContentBottom();){vtCursor(out,row++,1);if(!clearPage)vtClearLine(out);out.print(gSV());char buf[192];size_t j=0;while(i<end&&telnetMenuPageBuffer[i]!='\n'&&j<sizeof(buf)-1)buf[j++]=telnetMenuPageBuffer[i++];while(i<end&&telnetMenuPageBuffer[i]!='\n')i++;if(i<end&&telnetMenuPageBuffer[i]=='\n')i++;buf[j]=0;out.printf("%-*.*s",(int)(uiWidth()-2),(int)(uiWidth()-2),buf);out.print(gSV());}char foot[120];bool more=end<telnetMenuPageLength;snprintf(foot,sizeof(foot),"Line %u  %s%s",(unsigned)outputLineNumber(telnetMenuPageStart),telnetMenuPageStart?gUp():"",more?gDn():"");drawFooter(out,foot);}
 static void filterCapturedStatusSections(const char *const *wanted, uint8_t wantedCount) {
   char filtered[TELNET_MENU_PAGE_BUFFER_SIZE];
   size_t outLen = 0;
@@ -1489,16 +1520,18 @@ static void captureMenuCommand(const char *cmd){
   TelnetMenuBufferPrint capture;
   if (strcmp(cmd,"tasks")==0) {
     telnetDrawTasks(capture);
-  } else if (strcmp(cmd,"menu_observer")==0) {
+  } else if (strcmp(cmd,"menu_observer_basic")==0) {
+    capture.print(basicStatusText());
+  } else if (strcmp(cmd,"menu_observer_advanced")==0) {
     telnetExecuteCommand(String("current_state"),capture);
-    const char *wanted[] = {"=== MOUNT AND MOTION ===", "=== POSITION ==="};
-    filterCapturedStatusSections(wanted,2);
+  } else if (strcmp(cmd,"menu_system_basic")==0) {
+    capture.print(basicSystemHealthText());
   } else if (strcmp(cmd,"menu_time_location")==0) {
     telnetExecuteCommand(String("current_state"),capture);
     const char *wanted[] = {"=== TIME AND SITE ==="};
     filterCapturedStatusSections(wanted,1);
   } else if (strcmp(cmd,"menu_network")==0) {
-    telnetExecuteCommand(String("system_health"),capture);
+    capture.print(systemHealthText());
     const char *wanted[] = {"=== NETWORK ===", "=== CLOCK AND PERSISTENCE ==="};
     filterCapturedStatusSections(wanted,2);
   } else if (strcmp(cmd,"menu_protocol_ports")==0) {
@@ -1517,7 +1550,8 @@ static bool isRefreshableStatusCommand(const char *cmd){
   if(!cmd) return false;
   return strcmp(cmd,"status")==0 || strcmp(cmd,"current_state")==0 ||
          strcmp(cmd,"system_health")==0 || strcmp(cmd,"wifi status")==0 ||
-         strcmp(cmd,"tasks")==0 || strcmp(cmd,"menu_observer")==0 ||
+         strcmp(cmd,"tasks")==0 || strcmp(cmd,"menu_observer_basic")==0 ||
+         strcmp(cmd,"menu_observer_advanced")==0 || strcmp(cmd,"menu_system_basic")==0 ||
          strcmp(cmd,"menu_time_location")==0 || strcmp(cmd,"menu_network")==0 ||
          strcmp(cmd,"menu_protocol_ports")==0;
 }
@@ -1629,11 +1663,11 @@ static void refreshOutputPage(Print &out){
 
   captureMenuCommand(telnetMenuPageCommand);
 
-  // Keep the user on the same logical page after refresh. If the refreshed
-  // output has fewer pages, pageStartForNumber naturally clamps at the end.
+  // Keep the user at the same visible line offset after refresh whenever the
+  // refreshed output is long enough.
   telnetMenuPageNumber=oldPageNumber;
-  telnetMenuPageStart=pageStartForNumber(telnetMenuPageNumber,uiContentRows());
-  if(telnetMenuPageStart>=telnetMenuPageLength && telnetMenuPageNumber){
+  telnetMenuPageStart=oldStart<telnetMenuPageLength?oldStart:pageStartForNumber(telnetMenuPageNumber,uiContentRows());
+  if(telnetMenuPageStart>=telnetMenuPageLength){
     telnetMenuPageNumber=0;
     telnetMenuPageStart=0;
   }
@@ -1641,8 +1675,8 @@ static void refreshOutputPage(Print &out){
   // Compare visible rows and repaint only cells whose text changed. The header,
   // frame, unchanged status rows, and footer remain untouched, eliminating the
   // full-page flash seen in Windows telnet.exe.
-  const size_t oldEnd=pageEndIn(telnetMenuPreviousPageBuffer,oldLength,oldStart,uiContentRows());
-  const size_t newEnd=pageEnd(telnetMenuPageStart,uiContentRows());
+  const size_t oldEnd=outputWindowEndIn(telnetMenuPreviousPageBuffer,oldLength,oldStart,uiContentRows());
+  const size_t newEnd=outputWindowEnd(telnetMenuPageStart,uiContentRows());
   char oldLine[192],newLine[192];
   for(uint16_t row=0;row<uiContentRows();row++){
     extractVisiblePageLine(telnetMenuPreviousPageBuffer,oldStart,oldEnd,row,oldLine,sizeof(oldLine));
@@ -1665,8 +1699,8 @@ static void refreshOutputPage(Print &out){
   const bool newMore=newEnd<telnetMenuPageLength;
   if(oldPrevious!=newPrevious || oldMore!=newMore){
     char foot[120];
-    snprintf(foot,sizeof(foot),"Page %u  %s%s",
-             (unsigned)(telnetMenuPageNumber+1),
+    snprintf(foot,sizeof(foot),"Line %u  %s%s",
+             (unsigned)outputLineNumber(telnetMenuPageStart),
              newPrevious?gUp():"",
              newMore?gDn():"");
     drawFooter(out,foot);
@@ -1708,12 +1742,6 @@ static void redrawCurrent(Print &out){if(telnetMenuScreen==8)drawOutput(out);els
 static void backMenu(Print &out){telnetMenuFocus=0;telnetMenuNumericLength=0;telnetMenuNumericPrefix[0]=0;if(telnetMenuScreen==0){telnetStopMenu(out);if(telnetClient&&telnetClient.connected())out.print("> ");return;}if(telnetMenuScreen==8||telnetMenuScreen==7){telnetMenuScreen=telnetMenuReturnScreen;telnetMenuSelection=telnetMenuReturnSelection;}else{telnetMenuScreen=parentScreen(telnetMenuScreen);telnetMenuSelection=0;}drawMenu(out,true);}
 static void toggleFocusedCheckbox(Print &out) {
   if(!menuItemIsCheckbox(telnetMenuScreen,telnetMenuSelection)) return;
-  if(telnetMenuScreen==2 && telnetMenuSelection==0){
-    telnetStatusAdvanced=!telnetStatusAdvanced;
-    drawRow(out,0,true);
-    drawFooter(out,telnetStatusAdvanced?"Advanced status enabled":"Basic status enabled");
-    return;
-  }
   if(telnetMenuScreen==3 && telnetMenuSelection==3) {
     telnetLiveLogEnabled=!telnetLiveLogEnabled;
     telnetMenuSavedLiveLog=telnetLiveLogEnabled;
@@ -1728,20 +1756,19 @@ static void toggleFocusedCheckbox(Print &out) {
 }
 
 static uint32_t previousInterval(uint32_t value, bool idle) {
-  const uint32_t activeValues[] = {0,1000,2000,4000,8000};
-  const uint32_t idleValues[] = {0,2000,4000,8000};
-  const uint32_t *values = idle ? idleValues : activeValues;
-  uint8_t count = idle ? 4 : 5;
-  for(uint8_t i=0;i<count;i++) if(values[i]==value) return values[i?i-1:count-1];
-  return values[0];
+  (void)idle;
+  const uint32_t step = 1000UL;
+  const uint32_t maxValue = 60000UL;
+  if(value == 0) return maxValue;
+  value = (value / step) * step;
+  return value > step ? value - step : 0;
 }
 static uint32_t nextInterval(uint32_t value, bool idle) {
-  const uint32_t activeValues[] = {0,1000,2000,4000,8000};
-  const uint32_t idleValues[] = {0,2000,4000,8000};
-  const uint32_t *values = idle ? idleValues : activeValues;
-  uint8_t count = idle ? 4 : 5;
-  for(uint8_t i=0;i<count;i++) if(values[i]==value) return values[(i+1)%count];
-  return values[0];
+  (void)idle;
+  const uint32_t step = 1000UL;
+  const uint32_t maxValue = 60000UL;
+  value = ((value + step - 1) / step) * step;
+  return value >= maxValue ? 0 : value + step;
 }
 
 static unsigned long previousMenuRefreshInterval(unsigned long value) {
@@ -1785,21 +1812,22 @@ static void selectMenu(Print &out){telnetMenuFocus=0;
   if(telnetMenuScreen==0){if(telnetMenuSelection<5){telnetMenuScreen=telnetMenuSelection+1;telnetMenuSelection=0;drawMenu(out,true);}else{telnetStopMenu(out);if(telnetClient&&telnetClient.connected())out.print("> ");}return;}
   if(telnetMenuScreen==1){const char* cmds[]={"get","getaltaz",nullptr,"testinit","drain"};if(telnetMenuSelection==2){telnetMenuScreen=6;telnetMenuSelection=0;drawMenu(out,true);}else if(telnetMenuSelection==5)backMenu(out);else showCommand(out,menuLabel(1,telnetMenuSelection),cmds[telnetMenuSelection]);return;}
   if(telnetMenuScreen==2){
-    if(telnetMenuSelection==0){toggleFocusedCheckbox(out);return;}
-    if(telnetMenuSelection==7){backMenu(out);return;}
+    if(telnetMenuSelection==8){backMenu(out);return;}
     const char *cmd=nullptr;
     switch(telnetMenuSelection){
-      case 1: cmd="menu_observer"; break;
-      case 2: cmd=telnetStatusAdvanced?"system_health":"status"; break;
-      case 3: cmd="menu_network"; break;
-      case 4: cmd="menu_time_location"; break;
-      case 5: cmd="menu_protocol_ports"; break;
-      case 6: cmd="tasks"; break;
+      case 0: cmd="menu_observer_basic"; break;
+      case 1: cmd="menu_system_basic"; break;
+      case 2: cmd="menu_observer_advanced"; break;
+      case 3: cmd="system_health"; break;
+      case 4: cmd="menu_network"; break;
+      case 5: cmd="menu_time_location"; break;
+      case 6: cmd="menu_protocol_ports"; break;
+      case 7: cmd="tasks"; break;
     }
     if(cmd) showCommand(out,menuLabel(2,telnetMenuSelection),cmd);
     return;
   }
-  if(telnetMenuScreen==3){if(telnetMenuSelection<=2)adjustFocusedNumber(out,+1);else if(telnetMenuSelection==3)toggleFocusedCheckbox(out);else if(telnetMenuSelection==4)showConfirm(out,"Full WiFi mode","Save Full WiFi mode and reboot?","modewifi");else backMenu(out);return;}
+  if(telnetMenuScreen==3){if(telnetMenuSelection<=2)adjustFocusedNumber(out,+1);else if(telnetMenuSelection==3)toggleFocusedCheckbox(out);else if(telnetMenuSelection==4){if(bridgeMode==BRIDGE_MODE_WIFI_FULL)showConfirm(out,"Bluetooth mode","Save BT mode (Telnet only; no web interface) and reboot?","modebt");else showConfirm(out,"Full WiFi mode","Save Full WiFi mode and reboot?","modewifi");}else backMenu(out);return;}
   if(telnetMenuScreen==4){if(telnetMenuSelection<=4){uint8_t oldLevel=LOG_LEVEL;LOG_LEVEL=telnetMenuSelection+1;if(oldLevel>=1&&oldLevel<=5)drawRow(out,oldLevel-1,oldLevel-1==telnetMenuSelection);drawRow(out,telnetMenuSelection,true);drawFooter(out,"Log level changed");}else if(telnetMenuSelection==5)toggleFocusedCheckbox(out);else backMenu(out);return;}
   if(telnetMenuScreen==5){const char* cmds[]={"gpio_startup","telnet status",nullptr,"apdefault"};if(telnetMenuSelection==2)showConfirm(out,"Restart controller",bridgeMode==BRIDGE_MODE_BT_MIN_WEB?"Restart now? BT mode will return with Telnet only; no web interface.":"Restart now?","reboot");else if(telnetMenuSelection==3)showConfirm(out,"Restore AP defaults","Restore AP defaults and reboot?","apdefault");else if(telnetMenuSelection==4)backMenu(out);else showCommand(out,menuLabel(5,telnetMenuSelection),cmds[telnetMenuSelection]);return;}
   if(telnetMenuScreen==6){const char* cmds[]={"nudge az+","nudge az-","nudge alt+","nudge alt-"};if(telnetMenuSelection==4)backMenu(out);else showCommand(out,"Manual Nudge",cmds[telnetMenuSelection]);}
@@ -1848,7 +1876,7 @@ static bool activateHeaderFocus(Print &out) {
 }
 
 static void moveSelection(Print &out,int delta){if(telnetMenuFocus!=0)setMenuFocus(out,0);uint8_t count=menuCount(telnetMenuScreen),old=telnetMenuSelection;if(!count)return;int n=(int)old+delta;while(n<0)n+=count;while(n>=count)n-=count;telnetMenuSelection=(uint8_t)n;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}
-static void handleCsiFinal(uint8_t ch,Print &out){uint8_t count=menuCount(telnetMenuScreen);if(telnetMenuScreen==8){if(ch=='D')backMenu(out);else if(ch=='C'||(ch=='~'&&telnetMenuEscapeParam==6)){size_t n=pageEnd(telnetMenuPageStart,uiContentRows());if(n<telnetMenuPageLength){telnetMenuPageStart=n;telnetMenuPageNumber++;drawOutput(out,true);}}else if(ch=='~'&&telnetMenuEscapeParam==5&&telnetMenuPageStart){telnetMenuPageStart=previousPage(telnetMenuPageStart,uiContentRows());if(telnetMenuPageNumber)telnetMenuPageNumber--;drawOutput(out,true);}return;}uint8_t old=telnetMenuSelection;if(ch=='A')moveSelection(out,-1);else if(ch=='B')moveSelection(out,1);else if(ch=='Z')cycleMenuFocus(out,-1);else if(ch=='C'){if(!activateHeaderFocus(out)){if(!adjustFocusedNumber(out,+1))selectMenu(out);}}else if(ch=='D'){if(telnetMenuFocus!=0)setMenuFocus(out,0);else if(!adjustFocusedNumber(out,-1))backMenu(out);}else if(ch=='H'||(ch=='~'&&telnetMenuEscapeParam==1)|| (ch=='~'&&telnetMenuEscapeParam==7)){telnetMenuSelection=0;updateSelection(out,old,0);drawFooter(out);}else if(ch=='F'||(ch=='~'&&(telnetMenuEscapeParam==4||telnetMenuEscapeParam==8))){telnetMenuSelection=count?count-1:0;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}else if(ch=='~'&&telnetMenuEscapeParam==5){int n=(int)old-(int)uiContentRows();if(n<0)n=0;telnetMenuSelection=(uint8_t)n;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}else if(ch=='~'&&telnetMenuEscapeParam==6){int n=(int)old+(int)uiContentRows();if(n>=count)n=count-1;telnetMenuSelection=(uint8_t)n;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}}
+static void handleCsiFinal(uint8_t ch,Print &out){uint8_t count=menuCount(telnetMenuScreen);if(telnetMenuScreen==8){if(ch=='A'&&telnetMenuPageStart){telnetMenuPageStart=previousLineStart(telnetMenuPageStart);drawOutput(out,true);}else if(ch=='B'){size_t n=nextLineStart(telnetMenuPageStart);if(n<telnetMenuPageLength){telnetMenuPageStart=n;drawOutput(out,true);}}else if(ch=='D')backMenu(out);else if(ch=='C'||(ch=='~'&&telnetMenuEscapeParam==6)){size_t n=pageEnd(telnetMenuPageStart,uiContentRows());if(n<telnetMenuPageLength){telnetMenuPageStart=n;telnetMenuPageNumber++;drawOutput(out,true);}}else if(ch=='~'&&telnetMenuEscapeParam==5&&telnetMenuPageStart){telnetMenuPageStart=previousPage(telnetMenuPageStart,uiContentRows());if(telnetMenuPageNumber)telnetMenuPageNumber--;drawOutput(out,true);}return;}uint8_t old=telnetMenuSelection;if(ch=='A')moveSelection(out,-1);else if(ch=='B')moveSelection(out,1);else if(ch=='Z')cycleMenuFocus(out,-1);else if(ch=='C'){if(!activateHeaderFocus(out)){if(!adjustFocusedNumber(out,+1))selectMenu(out);}}else if(ch=='D'){if(telnetMenuFocus!=0)setMenuFocus(out,0);else if(!adjustFocusedNumber(out,-1))backMenu(out);}else if(ch=='H'||(ch=='~'&&telnetMenuEscapeParam==1)|| (ch=='~'&&telnetMenuEscapeParam==7)){telnetMenuSelection=0;updateSelection(out,old,0);drawFooter(out);}else if(ch=='F'||(ch=='~'&&(telnetMenuEscapeParam==4||telnetMenuEscapeParam==8))){telnetMenuSelection=count?count-1:0;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}else if(ch=='~'&&telnetMenuEscapeParam==5){int n=(int)old-(int)uiContentRows();if(n<0)n=0;telnetMenuSelection=(uint8_t)n;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}else if(ch=='~'&&telnetMenuEscapeParam==6){int n=(int)old+(int)uiContentRows();if(n>=count)n=count-1;telnetMenuSelection=(uint8_t)n;updateSelection(out,old,telnetMenuSelection);drawFooter(out);}}
 static bool activateNumericSelection(Print &out){if(!telnetMenuNumericLength)return false;uint16_t n=(uint16_t)atoi(telnetMenuNumericPrefix);telnetMenuNumericLength=0;telnetMenuNumericPrefix[0]=0;uint8_t count=menuCount(telnetMenuScreen);if(n<1||n>count){drawFooter(out,"Invalid menu item number");return true;}uint8_t old=telnetMenuSelection;telnetMenuSelection=(uint8_t)(n-1);updateSelection(out,old,telnetMenuSelection);selectMenu(out);return true;}
 static void handleMenuByte(uint8_t ch,Print &out){
   if(telnetMenuIgnoreNextLf){telnetMenuIgnoreNextLf=false;if(ch=='\n')return;}
