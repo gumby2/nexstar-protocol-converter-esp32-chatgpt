@@ -9,6 +9,7 @@
 #include "position_cache.h"
 #include "settings.h"
 #include "slew_controller.h"
+#include "time_services.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -47,7 +48,7 @@ const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
 
-const char* FW_VERSION = "v5.75";
+const char* FW_VERSION = "v5.76";
 const char* FW_NAME = "NexStar Protocol Converter";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
@@ -68,12 +69,6 @@ unsigned long webCpuLastIdle0 = 0;
 unsigned long webCpuLastIdle1 = 0;
 unsigned long webCpuLastRuntimeTotal = 0;
 int webCpuLoadPct = -1;
-
-double approxIpLatitudeDeg = 0.0;
-double approxIpLongitudeDeg = 0.0;
-String approxIpLocationText = "";
-String approxIpLocationStatus = "Not fetched";
-bool approxIpLocationValid = false;
 
 const char* currentWebRequestPath = "";
 
@@ -478,14 +473,6 @@ String alpacaPutValue(const char* primaryName) {
   return "";
 }
 
-String currentUtcIsoString() {
-  int y, mo, d, h, mi, se;
-  currentUtcParts(y, mo, d, h, mi, se);
-  char buf[28];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", y, mo, d, h, mi, se);
-  return String(buf);
-}
-
 bool safeFloatValue(const String &v, double &out) {
   if (v.length() == 0 || v.length() > 32) return false;
   out = v.toFloat();
@@ -528,94 +515,6 @@ String resetReasonText() {
     default: return "Unknown";
   }
 #endif
-}
-
-String twoDigits(int v) {
-  return (v < 10 ? "0" : "") + String(v);
-}
-
-String formatDurationHoursMinutes(unsigned long spanMs) {
-  unsigned long totalMinutes = spanMs / 60000UL;
-  unsigned long hours = totalMinutes / 60UL;
-  unsigned long minutes = totalMinutes % 60UL;
-  return String(hours) + ":" + twoDigits(minutes);
-}
-
-String formatLastSuccessfulMountPollTime() {
-  if (lastSuccessfulMountPollMs == 0) return "none";
-  String s = String(lastSuccessfulMountPollYear) + "-" + twoDigits(lastSuccessfulMountPollMonth) + "-" + twoDigits(lastSuccessfulMountPollDay);
-  s += " " + twoDigits(lastSuccessfulMountPollHour) + ":" + twoDigits(lastSuccessfulMountPollMinute) + ":" + twoDigits(lastSuccessfulMountPollSecond);
-  String tz = currentTimezoneAbbrev();
-  if (tz.length()) s += " " + tz;
-  return s;
-}
-
-String formatSuccessfulMountPollSpan() {
-  if (firstSuccessfulMountPollMs == 0 || lastSuccessfulMountPollMs == 0) return "0:00";
-  return formatDurationHoursMinutes(lastSuccessfulMountPollMs - firstSuccessfulMountPollMs);
-}
-
-String formatMountUptime() {
-  return formatSuccessfulMountPollSpan();
-}
-
-String formatHmsFromHours(double hours, int decimals = 1) {
-  while (hours < 0.0) hours += 24.0;
-  while (hours >= 24.0) hours -= 24.0;
-
-  int h = (int)floor(hours);
-  double rem = (hours - h) * 60.0;
-  int m = (int)floor(rem);
-  double sec = (rem - m) * 60.0;
-
-  if (sec >= 59.95 && decimals == 1) {
-    sec = 0.0;
-    m++;
-  }
-  if (m >= 60) {
-    m = 0;
-    h = (h + 1) % 24;
-  }
-
-  String s = twoDigits(h) + ":" + twoDigits(m) + ":";
-  if (decimals <= 0) s += twoDigits((int)round(sec));
-  else {
-    if (sec < 10.0) s += "0";
-    s += String(sec, decimals);
-  }
-  return s;
-}
-
-String observerTimeText() {
-  String s;
-  s += "TIME\n";
-  s += "Offset: " + String(utcOffsetMinutes) + " min";
-  String tz = currentTimezoneAbbrev();
-  if (tz.length()) s += " " + tz;
-  s += "\n";
-
-  if (!timeValid) {
-    s += "Local: not set\n";
-    s += "UTC: not set\n";
-    s += "Sidereal: unavailable\n";
-    return s;
-  }
-
-  int ly, lmo, ld, lh, lmi, ls;
-  int uy, umo, ud, uh, umi, us;
-  currentLocalParts(ly, lmo, ld, lh, lmi, ls);
-  currentUtcParts(uy, umo, ud, uh, umi, us);
-
-  double lstH = normalizeRA(gmstDegrees() + siteLongitudeDeg) / 15.0;
-
-  s += "Local: " + String(ly) + "-" + twoDigits(lmo) + "-" + twoDigits(ld) + " ";
-  s += twoDigits(lh) + ":" + twoDigits(lmi) + ":" + twoDigits(ls);
-  if (tz.length()) s += " " + tz;
-  s += "\n";
-  s += "UTC: " + String(uy) + "-" + twoDigits(umo) + "-" + twoDigits(ud) + "T";
-  s += twoDigits(uh) + ":" + twoDigits(umi) + ":" + twoDigits(us) + "Z\n";
-  s += "Sidereal: " + formatHmsFromHours(lstH, 1) + " LST\n";
-  return s;
 }
 
 String basicStatusText() {
@@ -801,81 +700,6 @@ String getLogText() {
   return out;
 }
 
-
-
-bool syncTimeFromNTP(bool forceLog = true) {
-  if (forceLog) {
-    LOG_TIME_I("NTP sync requested: enabled=%d staConnected=%d wifiStatus=%d server1=%s server2=%s tz=%s",
-               ntpEnabled ? 1 : 0,
-               (staConnected && WiFi.status() == WL_CONNECTED) ? 1 : 0,
-               (int)WiFi.status(),
-               ntpServer1,
-               ntpServer2,
-               tzRule);
-  }
-
-  if (!ntpEnabled) {
-    if (forceLog) LOG_TIME_W("NTP sync skipped: NTP is disabled");
-    return false;
-  }
-
-  if (!staConnected || WiFi.status() != WL_CONNECTED) {
-    if (forceLog) LOG_TIME_W("NTP sync skipped: STA WiFi is not connected");
-    return false;
-  }
-
-  if (forceLog) LOG_TIME_D("NTP configTzTime starting");
-  configTzTime(tzRule, ntpServer1, ntpServer2);
-
-  struct tm tminfo;
-  if (forceLog) LOG_TIME_T("NTP getLocalTime waiting up to 10000 ms");
-  bool ok = getLocalTime(&tminfo, 10000);
-  if (!ok) {
-    ntpSyncValid = false;
-    if (forceLog) LOG_TIME_W("NTP sync failed: getLocalTime timed out or returned false");
-    return false;
-  }
-
-  localYear = tminfo.tm_year + 1900;
-  localMonth = tminfo.tm_mon + 1;
-  localDay = tminfo.tm_mday;
-  localHour = tminfo.tm_hour;
-  localMinute = tminfo.tm_min;
-  localSecond = tminfo.tm_sec;
-  timeSetMillis = millis();
-  timeValid = true;
-  ntpSyncValid = true;
-  lastNtpSyncMs = millis();
-  markTimeSource(TIME_SRC_NTP);
-
-  if (forceLog) {
-    LOG_TIME_I("NTP sync successful: local=%04d-%02d-%02d %02d:%02d:%02d source=NTP",
-               localYear, localMonth, localDay, localHour, localMinute, localSecond);
-    LOG_TIME_D("NTP state updated: timeValid=%d ntpSyncValid=%d lastNtpSyncMs=%lu",
-               timeValid ? 1 : 0, ntpSyncValid ? 1 : 0, lastNtpSyncMs);
-  }
-
-  return true;
-}
-
-void serviceNtpSync() {
-  static unsigned long lastAttemptMs = 0;
-  if (!ntpEnabled || !staConnected || WiFi.status() != WL_CONNECTED) return;
-
-  unsigned long now = millis();
-  if (!timeValid) {
-    if (now - lastAttemptMs > 5000) {
-      lastAttemptMs = now;
-      syncTimeFromNTP(false);
-    }
-    return;
-  }
-
-  if (now - lastNtpSyncMs > 6UL * 3600UL * 1000UL && now - lastAttemptMs > 5000) {
-    lastAttemptMs = now;
-    syncTimeFromNTP(false);
-  }
-}
 String urlDecodeSimple(String s) {
   s.replace("+", " ");
   String out = "";
@@ -1459,7 +1283,7 @@ void sendWebPage() {
   server.sendContent(F("</div>"));
 
   server.sendContent(F("<div id='tab_setup' class='tab'>"));
-  server.sendContent(F("<div class='card'><h3>Site / Time / Polling</h3><div id='siteMsg' class='msg'></div><div class='formrow'><label>Latitude</label><input id='lat'></div><div class='formrow'><label>Longitude east-positive</label><input id='lon'></div><div class='formrow'><label>UTC offset minutes</label><input id='offset'></div><div class='formrow'><label>Date</label><div><input id='year' style='width:78px'> - <input id='month' style='width:58px'> - <input id='day' style='width:58px'></div></div><div class='formrow'><label>Time</label><div><input id='hour' style='width:58px'> : <input id='minute' style='width:58px'> : <input id='second' style='width:58px'></div></div><div class='formrow'><label>Active poll interval ms</label><input id='poll'></div><div class='formrow'><label>Idle poll interval ms</label><input id='idlepoll'></div><div class='formrow'><label>Client throttle ms</label><input id='throttle'></div><div class='actions'><button onclick='saveManualSiteTime()'>Save Site / Time / Polling</button><button onclick='clearSavedSite()'>Clear Saved Last Location</button></div><div class='hint'>Active polling starts after SkySafari, Stellarium, Alpaca, or the status page requests position. Idle polling is used otherwise.</div></div>"));
+  server.sendContent(F("<div class='card'><h3>Site / Time / Polling</h3><div id='siteMsg' class='msg'></div><div class='formrow'><label>Latitude</label><input id='lat'></div><div class='formrow'><label>Longitude east-positive</label><input id='lon'></div><div class='formrow'><label>UTC offset minutes</label><input id='offset'></div><div class='formrow'><label>Date</label><div><input id='year' style='width:78px'> - <input id='month' style='width:58px'> - <input id='day' style='width:58px'></div></div><div class='formrow'><label>Time</label><div><input id='hour' style='width:58px'> : <input id='minute' style='width:58px'> : <input id='second' style='width:58px'></div></div><div class='formrow'><label>Active poll interval ms</label><input id='poll'></div><div class='formrow'><label>Idle poll interval ms</label><input id='idlepoll'></div><div class='formrow'><label>Client throttle ms</label><input id='throttle'></div><div class='actions'><button onclick='saveManualSiteTime()'>Save Site / Time / Polling</button><button onclick='startHttpsTimeLocation()'>GPS Sync</button><button onclick='clearSavedSite()'>Clear Saved Last Location</button></div><div class='hint'>Active polling starts after SkySafari, Stellarium, Alpaca, or the status page requests position. Idle polling is used otherwise.</div></div>"));
   server.sendContent(F("<div class='card'><h3>Time / NTP</h3><div id='ntpMsg' class='msg'></div><div class='formrow'><label>Enable NTP</label><label style='font-weight:normal'><input type='checkbox' id='ntp_enable'></label></div><div class='formrow'><label>NTP server 1</label><input id='ntp1' value='pool.ntp.org'></div><div class='formrow'><label>NTP server 2</label><input id='ntp2' value='time.nist.gov'></div><div class='formrow'><label>TZ / DST rule</label><input id='tzrule' value='MST7MDT,M3.2.0/2,M11.1.0/2'></div><div class='actions'><button onclick='saveNtp()'>Save NTP Settings</button><button onclick='syncNtp()'>Sync NTP Now</button></div><div class='hint'>Uses STA WiFi or phone hotspot internet. Default TZ is US Mountain with DST.</div></div>"));
   server.sendContent(F("<div class='card'><h3>Approx Internet Location</h3><div id='ipLocMsg' class='msg'></div><p class='small'>Uses public IP geolocation. City-level only; verify before precision alignment.</p>Status: <span id='ipLocStatus'>Not fetched</span><br>Lat/Lon: <span id='ipLocLatLon'>none</span><br><span id='ipLocText' class='small'></span><br><button onclick='fetchIpLoc()'>Get Approx Location</button><button onclick='useIpLoc()'>Use This Location</button></div>"));
   server.sendContent(F("<div class='card'><h3>STA WiFi Setup</h3><div id='wifiMsg' class='msg'></div><div class='formrow'><label>STA SSID</label><input id='wifi_ssid'></div><div class='formrow'><label>STA Password</label><input id='wifi_pass' type='text' value='"));
@@ -2527,108 +2351,6 @@ void handleSetWiFiPage() {
 }
 
 
-bool extractJsonNumber(const String &body, const String &key, double &out) {
-  int k = body.indexOf("\"" + key + "\"");
-  if (k < 0) return false;
-  int colon = body.indexOf(':', k);
-  if (colon < 0) return false;
-  int start = colon + 1;
-  while (start < (int)body.length() && (body[start] == ' ' || body[start] == '\t' || body[start] == '\r' || body[start] == '\n')) start++;
-  int end = start;
-  while (end < (int)body.length()) {
-    char c = body[end];
-    if (!((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.')) break;
-    end++;
-  }
-  if (end <= start) return false;
-  out = body.substring(start, end).toDouble();
-  return true;
-}
-
-String extractJsonString(const String &body, const String &key) {
-  int k = body.indexOf("\"" + key + "\"");
-  if (k < 0) return "";
-  int colon = body.indexOf(':', k);
-  if (colon < 0) return "";
-  int q1 = body.indexOf('"', colon + 1);
-  if (q1 < 0) return "";
-  int q2 = body.indexOf('"', q1 + 1);
-  if (q2 < 0) return "";
-  return body.substring(q1 + 1, q2);
-}
-
-bool fetchApproxLocationFromInternet() {
-  approxIpLocationValid = false;
-
-  if (!staConnected || WiFi.status() != WL_CONNECTED) {
-    approxIpLocationStatus = "STA WiFi is not connected";
-    LOG_TIME_W("IP geolocation failed: STA WiFi is not connected");
-    return false;
-  }
-
-#if defined(ESP8266)
-  WiFiClient client;
-  HTTPClient http;
-  bool beginOk = http.begin(client, "http://ip-api.com/json/?fields=status,message,lat,lon,city,regionName,country,query");
-#else
-  HTTPClient http;
-  bool beginOk = http.begin("http://ip-api.com/json/?fields=status,message,lat,lon,city,regionName,country,query");
-#endif
-
-  if (!beginOk) {
-    approxIpLocationStatus = "HTTP begin failed";
-    LOG_TIME_W("IP geolocation failed: HTTP begin failed");
-    return false;
-  }
-
-  http.setTimeout(7000);
-  int code = http.GET();
-  if (code != 200) {
-    approxIpLocationStatus = "HTTP error " + String(code);
-    LOG_TIME_W("IP geolocation failed: HTTP code %d", code);
-    http.end();
-    return false;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  if (body.indexOf("\"status\":\"success\"") < 0) {
-    String msg = extractJsonString(body, "message");
-    approxIpLocationStatus = "Service failed" + (msg.length() ? ": " + msg : "");
-    LOG_TIME_W("IP geolocation service failed: %s", approxIpLocationStatus.c_str());
-    return false;
-  }
-
-  double lat = 0.0;
-  double lon = 0.0;
-  if (!extractJsonNumber(body, "lat", lat) || !extractJsonNumber(body, "lon", lon)) {
-    approxIpLocationStatus = "No lat/lon in response";
-    LOG_TIME_W("IP geolocation failed: no lat/lon in response");
-    return false;
-  }
-
-  approxIpLatitudeDeg = lat;
-  approxIpLongitudeDeg = lon;
-  String city = extractJsonString(body, "city");
-  String region = extractJsonString(body, "regionName");
-  String country = extractJsonString(body, "country");
-  String ip = extractJsonString(body, "query");
-
-  approxIpLocationText = city;
-  if (region.length()) approxIpLocationText += (approxIpLocationText.length() ? ", " : "") + region;
-  if (country.length()) approxIpLocationText += (approxIpLocationText.length() ? ", " : "") + country;
-  if (ip.length()) approxIpLocationText += " IP " + ip;
-
-  approxIpLocationStatus = "Approx IP location fetched";
-  approxIpLocationValid = true;
-
-  LOG_TIME_I("IP geolocation approximate location: lat=%.6f lon=%.6f %s",
-       approxIpLatitudeDeg, approxIpLongitudeDeg, approxIpLocationText.c_str());
-  return true;
-}
-
-
 void handleFetchIpLocationPage() {
   logHttpRequest("FETCH_IP_LOCATION");
   LOG_SET_I("Setup button pressed: Get Approx Internet Location");
@@ -3162,10 +2884,6 @@ void handleTimeLocationStatusPage() {
   server.send(200, "text/plain", s);
 }
 
-bool browserTimeLocationEstablished() {
-  return timeValid && siteValid;
-}
-
 bool requestCameFromApSubnet() {
 #if defined(ESP32)
   if (!apRunning) return false;
@@ -3175,20 +2893,6 @@ bool requestCameFromApSubnet() {
 #else
   return false;
 #endif
-}
-
-String currentTimezoneAbbrev() {
-  if (utcOffsetMinutes == -420) return "MST";
-  if (utcOffsetMinutes == -360) return "MDT";
-  int off = utcOffsetMinutes;
-  char sign = '+';
-  if (off < 0) {
-    sign = '-';
-    off = -off;
-  }
-  char buf[12];
-  snprintf(buf, sizeof(buf), "UTC%c%02d:%02d", sign, off / 60, off % 60);
-  return String(buf);
 }
 
 void redirectToHttpsSetup443() {
@@ -5600,120 +5304,6 @@ void handleConsole() {
 
 
 #if defined(ESP32)
-String httpParamValue(const String &url, const String &name) {
-  String key = name + "=";
-  int q = url.indexOf('?');
-  if (q < 0) return "";
-  int p = url.indexOf(key, q + 1);
-  if (p < 0) return "";
-  p += key.length();
-  int e = url.indexOf('&', p);
-  if (e < 0) e = url.length();
-  return urlDecodeSimple(url.substring(p, e));
-}
-
-void applyHttpsBrowserTimeLocationFromUrl(const String &url, bool &gotLocation) {
-  gotLocation = false;
-  double latDeg = siteLatitudeDeg;
-  double lonDeg = siteLongitudeDeg;
-  bool hasElevation = false;
-  double elevationMeters = siteElevationMeters;
-  bool hasOffset = false;
-  int offsetMinutes = utcOffsetMinutes;
-  bool hasYear = false;
-  int year = localYear;
-  bool hasMonth = false;
-  int month = localMonth;
-  bool hasDay = false;
-  int day = localDay;
-  bool hasHour = false;
-  int hour = localHour;
-  bool hasMinute = false;
-  int minute = localMinute;
-  bool hasSecond = false;
-  int second = localSecond;
-
-  String v;
-  v = httpParamValue(url, "lat");
-  if (v.length()) {
-    latDeg = v.toFloat();
-    gotLocation = true;
-  }
-  v = httpParamValue(url, "lon");
-  if (v.length()) {
-    lonDeg = v.toFloat();
-    gotLocation = true;
-  }
-
-  v = httpParamValue(url, "elev");
-  if (v.length()) {
-    hasElevation = true;
-    elevationMeters = v.toFloat();
-  }
-
-  v = httpParamValue(url, "offset");
-  if (v.length()) {
-    hasOffset = true;
-    offsetMinutes = v.toInt();
-  }
-
-  v = httpParamValue(url, "year");
-  if (v.length()) {
-    hasYear = true;
-    year = v.toInt();
-  }
-  v = httpParamValue(url, "month");
-  if (v.length()) {
-    hasMonth = true;
-    month = v.toInt();
-  }
-  v = httpParamValue(url, "day");
-  if (v.length()) {
-    hasDay = true;
-    day = v.toInt();
-  }
-  v = httpParamValue(url, "hour");
-  if (v.length()) {
-    hasHour = true;
-    hour = v.toInt();
-  }
-  v = httpParamValue(url, "minute");
-  if (v.length()) {
-    hasMinute = true;
-    minute = v.toInt();
-  }
-  v = httpParamValue(url, "second");
-  if (v.length()) {
-    hasSecond = true;
-    second = v.toInt();
-  }
-
-  applyHttpsBrowserTimeLocationValues(
-    gotLocation, latDeg, lonDeg,
-    hasElevation, elevationMeters,
-    hasOffset, offsetMinutes,
-    hasYear, year,
-    hasMonth, month,
-    hasDay, day,
-    hasHour, hour,
-    hasMinute, minute,
-    hasSecond, second
-  );
-  savePersistentSettings();
-
-  LOG_TIME_I("Browser HTTPS site/time update: location=%s lat=%.6f lon=%.6f offset=%d date=%04d-%02d-%02d time=%02d:%02d:%02d",
-             gotLocation ? "yes" : "no",
-             siteLatitudeDeg,
-             siteLongitudeDeg,
-             utcOffsetMinutes,
-             localYear,
-             localMonth,
-             localDay,
-             localHour,
-             localMinute,
-             localSecond);
-}
-
 String httpsAutoDeviceTimeLocationScript() {
   String js;
   js.reserve(2600);
