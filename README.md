@@ -1,64 +1,34 @@
 # NexStar Protocol Converter
 
-ESP32 firmware for bridging and translating telescope-control protocols for an original Celestron NexStar mount.
+ESP32 firmware for bridging telescope-control clients to an original Celestron NexStar mount while preserving the mount's single-command protocol behavior.
 
-## Current baseline
+## Tested Baseline
 
-- Firmware: **v5.29**
-- Target: **ESP32 Dev Module**
-- ESP32 Arduino core: **3.3.10**
-- Partition scheme: **Huge APP**
-- UART2: RX GPIO 16, TX GPIO 17
+v5.75 is the tested working refactor baseline.
+
+## Target
+
+- Board: ESP32 Dev Module
+- ESP32 Arduino core: 3.3.10
+- FQBN: `esp32:esp32:esp32:PartitionScheme=huge_app`
+- Mount UART: RX GPIO 16, TX GPIO 17
 
 ## Build
 
+Install Arduino CLI and the ESP32 core:
+
 ```bash
 arduino-cli core install esp32:esp32@3.3.10
-./tools/compile-linux.sh
 ```
 
-Windows PowerShell:
-
-```powershell
-./tools/compile-windows.ps1
-```
-
-## Development workflow
-
-Run the static checks:
+Compile:
 
 ```bash
-./scripts/test.sh
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.75
 ```
 
-Compile the ESP32 firmware:
+Upload:
 
 ```bash
-./scripts/build.sh
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.75
 ```
-
-Run the full local verification:
-
-```bash
-./scripts/verify.sh
-```
-
-The development scripts support these environment overrides:
-
-- `ARDUINO_CLI`
-- `BUILD_PATH`
-- `OUTPUT_DIR`
-- `JOBS`
-
-## Important mount constraints
-
-The original NexStar mount is strictly single-command. No new command may be accepted or forwarded while an earlier mount command is active. A completed command returns `@`. Position polling must not occur during an active GOTO, and AbortSlew is unsupported.
-
-## Repository layout
-
-- `firmware/Nexstar_Protocol_Converter/` — Arduino-compatible stable sketch path
-- `releases/` — versioned source snapshots
-- `tools/` — local compile and browser-test utilities
-- `.github/workflows/` — automated ESP32 build and browser checks
-- `docs/` — user and protocol documentation
-- `hardware/` — wiring notes and diagrams

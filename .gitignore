@@ -3,8 +3,10 @@ dist/
 *.bin
 *.elf
 *.map
+*.hex
+*.eep
 *.zip
 arduino-cli
 *.tar.gz
 
-firmware/Nexstar_Protocol_Converter/build/
+firmware/*/build/

@@ -1,0 +1,73 @@
+#pragma once
+
+#include <Arduino.h>
+
+#if defined(ESP32)
+extern "C" {
+  #include "esp_https_server.h"
+}
+#endif
+
+// HTTPS setup certificate, key, and related state.
+// Extracted from the main sketch without behavior changes.
+
+#if defined(ESP32)
+const uint16_t HTTPS_SETUP_PORT = 443;
+const bool HTTPS_WEB_AUTO_START = false; // v3.30: keep HTTP port 80 alive; GPS Sync starts HTTPS on demand
+httpd_handle_t httpsSetupServerHandle = NULL;
+unsigned long httpsSetupStopAtMillis = 0;
+String gpsSyncReturnUrl = "http://192.168.4.1/";
+const char HTTPS_SETUP_CERT[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDCDCCAfCgAwIBAgIUIB273RE0jgQCdZtinymIq1x1H68wDQYJKoZIhvcNAQEL
+BQAwFjEUMBIGA1UEAwwLMTkyLjE2OC40LjEwHhcNMjYwNzA0MjMyNjIyWhcNMzYw
+NzAxMjMyNjIyWjAWMRQwEgYDVQQDDAsxOTIuMTY4LjQuMTCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBALZJxI/tOStsYH8b/N0Hkhc8aiUVfXDohF7ahU0p
+1wYNzsbpJLWR2wilOQb7dN/vAXibnmR1cej/5YSFKZT77IMnNktJrVQMULeisvFU
+CJo49chJdArmhG1qz43dRKpx7XZN895CcsJWTybs7iJPDkeadEMWh+pxw5UQP0z2
+jjoEY79YoK3uKmRiq3ff3WXf3sJUKUBonXRvQbaFBcqNmEizFPrkFs/UHhZVIhRY
+e4B6nl8Goluntflu3fIHFB51a7zDsGoYx529roRMu/kFY+a0RlqshivfmwclSOFt
+/vHrviwEQ1wXPb6fh36TDyx3X+BnSRVgTkyre28ijY6fFt0CAwEAAaNOMEwwKwYD
+VR0RBCQwIocEwKgEAYINbmV4c3Rhci5sb2NhbIILZXNwMzIubG9jYWwwHQYDVR0O
+BBYEFHnCedu2IdUMUYOW0/eUafTC7ivHMA0GCSqGSIb3DQEBCwUAA4IBAQACq3cB
+tPOUJRvOpEjH0eGQtYMPXTsjBSYmS93KVaZ7EHYSMOSlIdvfCOnkYB11jC2PNHLo
+OIPMumWyxrwXzu8wYU1ycz9Tb1iK/naLqqvMhKTiLe/FHW+C3rsRs+J8emH/c3XC
+Z4EAsgshdn25E0zBEmliUKqjTzCEIkefGr3MLZ+8zbvhq1ztA+NeFtfiHx+x7cm6
+B85wld3aUh5np4+60sMyv6XBNO8a4gVQHLAXZNzXyKepLp3E1ccN32ebHygKvfw/
+UMfnUUQQsPRoJi3nGO3FzF4mjOGE/f3k/gFr949jS879rn8hgx3zm8/cepW+OAhO
+VYgIyaiofucDv5bH
+-----END CERTIFICATE-----
+
+)EOF";
+const char HTTPS_SETUP_KEY[] PROGMEM = R"EOF(
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC2ScSP7TkrbGB/
+G/zdB5IXPGolFX1w6IRe2oVNKdcGDc7G6SS1kdsIpTkG+3Tf7wF4m55kdXHo/+WE
+hSmU++yDJzZLSa1UDFC3orLxVAiaOPXISXQK5oRtas+N3USqce12TfPeQnLCVk8m
+7O4iTw5HmnRDFofqccOVED9M9o46BGO/WKCt7ipkYqt3391l397CVClAaJ10b0G2
+hQXKjZhIsxT65BbP1B4WVSIUWHuAep5fBqJbp7X5bt3yBxQedWu8w7BqGMedva6E
+TLv5BWPmtEZarIYr35sHJUjhbf7x674sBENcFz2+n4d+kw8sd1/gZ0kVYE5Mq3tv
+Io2OnxbdAgMBAAECggEAAaZdm5SLlGuI3LhS9miCTNM0qLzu443kiNE/LJ7I00Ve
+Y5QqS2Rpuu8ikCrII4YPxC4wZaYJz7s6h2kHInyR5vFSFKYIO2mtygO0d+peoOVh
+ascowDfW51X0pqA5O2EIQ65amzPhwwWHS4m7HAoNeIjFgvKaF1KhRmDybw66OdHa
+xSByZB3xESB3F+Hi1ya6r6jkjq2XTzyQJCgAD3/ViNafjQ6k+Qko7yiz5//VE6WA
+XsFTwcYYLhkZEIlqnIyj0JuTTPHGWwHh/o7I3N78C6Hgi+eWhTmssgfCe7yyPSTw
+Cyops5s1wsFtl6BKkFFUvTR4aOT8yDgk2cEOWKapwQKBgQDiORmiGKhqFoEWbqPD
+G47UPw4H/MtS98LjTlQlOv4/pqVF4D4MAkQ+5CAP6Pr1IVKA7v6omjLeTn0DEWqn
+sBcv2SYeoe8u8PMe8vO7r2E09rYkhrq2AiNH7eb72OJIsgxIV1uhAEexbX6+hvHE
+9gwUbnrtLEcsg1Zfz1lVQIVHvQKBgQDOSDhw7L1vkaAsqLaTZ6JSDzdcyrUa8YsL
+vIEOz+k+l3vo/jlFRsd8qGbRj4iBoil5eDfN1ak6RegS/zCJN87vdtURO92nAtxm
+FvIaZzLbcqbNsRKAeRADhvTaqmIlhcjv2i4fZrXavF3Y+/8BTNW6IVfF/oF/o2KZ
+wxJ5PZ/toQKBgFOqZo6KrA7AT/Gp7asFECfzQg82MUR4GX3TxE8YqFuGGG3lZ00t
+sWvJFwqLUfVC466HtWtJzDJnuNhfoqBuAcVSfESsAzfLKT9y/y2UyVC7RdXwdjFG
+TSIXHGxcZCQapWxD0sGSxvEZ29w/MD91+DW+Pnxk+dW+pT0+BH4BJMnJAoGAUJPl
+eDcByJMZ/lfo+auBvIw1FAoatGul5O+9egu9ELYbsOedd3IueoNNpo5qxDiT+t76
+7WyIrjqgbMtCKleifeftUs4Pxy1W6ooMCERHmXEvtyl0ELs5hicxfjkQHZgk5YxU
+d++nGcp63keRVPCujAZ6Qt0nuLQZz/ZjQPjRgAECgYA+WvF88RrUndnspVowD1RZ
+AxQzZx9TY0L8Gvs9BO485SxbIfP1YHP/AW/RDbyAGDE1xwKacBw1CL/HjCS23uqD
+hn0xtU+c3FAyxInsmgsbUNjjj/0oe7xelSps/s3sk0GCsZoZf9UNJyU81Q/aRcyj
++ctPZV64I7RxyooyHcUguw==
+-----END PRIVATE KEY-----
+
+)EOF";
+#endif
