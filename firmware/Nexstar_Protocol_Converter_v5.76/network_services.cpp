@@ -7,6 +7,7 @@
 #include "observer_time.h"
 #include "position_cache.h"
 #include "settings.h"
+#include "slew_controller.h"
 
 #if defined(ESP32)
   #include "esp_heap_caps.h"
@@ -182,9 +183,6 @@ extern String runtimeApSsid();
 extern bool savePersistentSettings();
 extern bool syncTimeFromNTP(bool forceLog);
 extern void serviceNtpSync();
-extern void handleStellariumPacket(uint8_t *pkt, uint16_t len);
-extern void sendStellariumPosition();
-extern void markPositionDemand(const char* reason);
 extern void telnetDrawMonitor(Print &out);
 extern void telnetStopMonitor(Print &out);
 extern void telnetDrawTasks(Print &out);
@@ -297,6 +295,155 @@ private:
 static uint16_t readLE16Network(const uint8_t *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
+
+uint16_t readLE16(const uint8_t *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+int32_t readLE32s(const uint8_t *p) {
+  uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  return (int32_t)v;
+}
+
+uint32_t readLE32u(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+int64_t readLE64s(const uint8_t *p) {
+  uint64_t v = 0;
+  for (int i = 7; i >= 0; i--) {
+    v <<= 8;
+    v |= p[i];
+  }
+  return (int64_t)v;
+}
+
+void writeLE16(uint8_t *p, uint16_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+}
+
+void writeLE32(uint8_t *p, uint32_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+  p[2] = (v >> 16) & 0xFF;
+  p[3] = (v >> 24) & 0xFF;
+}
+
+void writeLE64(uint8_t *p, int64_t v) {
+  uint64_t u = (uint64_t)v;
+  for (int i = 0; i < 8; i++) {
+    p[i] = (uint8_t)(u & 0xFF);
+    u >>= 8;
+  }
+}
+
+uint32_t stellariumRaToUint(double raDeg) {
+  raDeg = normalizeRA(raDeg);
+  double v = (raDeg / 360.0) * 4294967296.0;
+  if (v < 0) v = 0;
+  if (v > 4294967295.0) v = 4294967295.0;
+  return (uint32_t)(v + 0.5);
+}
+
+int32_t stellariumDecToInt(double decDeg) {
+  double v = (decDeg / 360.0) * 4294967296.0;
+  if (v < -2147483648.0) v = -2147483648.0;
+  if (v > 2147483647.0) v = 2147483647.0;
+  return (int32_t)(v + (v >= 0 ? 0.5 : -0.5));
+}
+
+double stellariumUintToRaDeg(uint32_t raw) {
+  return normalizeRA(((double)raw / 4294967296.0) * 360.0);
+}
+
+double stellariumIntToDecDeg(int32_t raw) {
+  return ((double)raw / 4294967296.0) * 360.0;
+}
+
+void sendStellariumPosition() {
+  if (!stellariumClient || !stellariumClient.connected()) return;
+  markPositionDemand("Stellarium position TX");
+
+  double ra = 0.0;
+  double dec = 0.0;
+
+  if (!mountPositionApiRaDec(ra, dec, nullptr)) {
+    LOGW("Stellarium position send skipped: no RA/Dec cache");
+    return;
+  }
+
+  uint8_t pkt[24];
+  memset(pkt, 0, sizeof(pkt));
+
+  writeLE16(pkt + 0, 24);
+  writeLE16(pkt + 2, 0); // current position
+  writeLE64(pkt + 4, (int64_t)millis());
+  writeLE32(pkt + 12, stellariumRaToUint(ra));
+  writeLE32(pkt + 16, (uint32_t)stellariumDecToInt(dec));
+  writeLE32(pkt + 20, 0); // status OK/idle
+
+  stellariumClient.write(pkt, sizeof(pkt));
+  stellariumLastTxMs = millis();
+  stellariumTxPackets++;
+  LOG_STEL_D("Stellarium TX position packet #%lu RA=%.6f DEC=%.6f",
+       (unsigned long)stellariumTxPackets, ra, dec);
+}
+
+void handleStellariumPacket(uint8_t *pkt, uint16_t len) {
+  markPositionDemand("Stellarium RX");
+  stellariumLastRxMs = millis();
+  stellariumRxPackets++;
+
+  if (len < 4) {
+    stellariumBadPackets++;
+    LOGW("Stellarium RX bad short packet len=%u", len);
+    return;
+  }
+
+  uint16_t type = readLE16(pkt + 2);
+  LOGD("Stellarium RX packet #%lu len=%u type=%u",
+       (unsigned long)stellariumRxPackets, len, type);
+
+  if (LOG_LEVEL >= LOG_TRACE) {
+    String raw = "Stellarium raw:";
+    for (uint16_t i = 0; i < len && i < 32; i++) {
+      char b[5];
+      snprintf(b, sizeof(b), " %02X", pkt[i]);
+      raw += b;
+    }
+    LOGT("%s", raw.c_str());
+  }
+
+  // Stellarium telescope-control client sends a 20-byte GOTO packet:
+  // uint16 length, uint16 type, int64 time, uint32 RA, int32 DEC.
+  if (len >= 20) {
+    uint32_t rawRa = readLE32u(pkt + 12);
+    int32_t rawDec = readLE32s(pkt + 16);
+
+    double raDeg = stellariumUintToRaDeg(rawRa);
+    double decDeg = stellariumIntToDecDeg(rawDec);
+
+    LOG_STEL_I("Stellarium RX packet len=%u type=%u GOTO RA_deg=%.6f DEC_deg=%.6f",
+         len, type, raDeg, decDeg);
+
+    if (mountCommandPathBusy()) {
+      LOG_STEL_W("Stellarium GOTO queued: mount busy");
+      enqueueGotoRaDec(raDeg, decDeg, LX_SRC_WIFI, "Stellarium GOTO while mount busy");
+    } else {
+      queueAsyncSlew(raDeg, decDeg);
+    }
+
+    // Do not overwrite current-position cache with Stellarium target.
+    markGotoQueueImmediateAck("Stellarium", "binary GOTO accepted; position response sent from cache");
+    sendStellariumPosition();
+    return;
+  }
+
+  stellariumBadPackets++;
+  LOG_STEL_W("Stellarium RX short/unknown packet len=%u type=%u", len, type);
+}
+
 
 void serviceHttpServers() {
   if (bridgeMode != BRIDGE_MODE_WIFI_FULL) return;
