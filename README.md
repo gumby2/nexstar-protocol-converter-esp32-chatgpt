@@ -4,7 +4,7 @@ ESP32 firmware for bridging telescope-control clients to an original Celestron N
 
 ## Tested Baseline
 
-v5.76 is the tested working baseline.
+v5.86 is the tested working baseline.
 
 ## Target
 

@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include "bluetooth_services.h"
+#include "console_commands.h"
+#include "https_setup_server.h"
+#include "task_diagnostics.h"
 #include "logging.h"
 #include "lx200_protocol.h"
 #include "mount_transport.h"
@@ -9,6 +12,7 @@
 #include "position_cache.h"
 #include "settings.h"
 #include "slew_controller.h"
+#include "slew_web_handlers.h"
 #include "time_services.h"
 #include <math.h>
 #include <stddef.h>
@@ -32,9 +36,6 @@
   #include <WebServer.h>
 
   #include <WiFiUdp.h>
-  extern "C" {
-    #include "esp_https_server.h"
-  }
   #include "esp_heap_caps.h"
   #include "esp_system.h"
   #include "freertos/FreeRTOS.h"
@@ -48,7 +49,7 @@ const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
 
-const char* FW_VERSION = "v5.76";
+const char* FW_VERSION = "v5.86";
 const char* FW_NAME = "NexStar Protocol Converter";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
@@ -57,9 +58,6 @@ const unsigned long WEB_STATUS_REFRESH_MS = 8000;
 const unsigned long WEB_LOG_REFRESH_MS = 5000;
 extern const bool SERIAL_MIRROR_FULL_WIFI_LOGS = true; // mirror the same formatted Full WiFi log lines to USB serial
 
-
-// HTTPS setup credentials and state are stored separately.
-#include "https_credentials.h"
 
 uint32_t positionApiCacheReplies = 0;
 uint32_t positionApiCacheMisses = 0;
@@ -174,154 +172,6 @@ bool routeLX200SourceThroughCommonMountCore(uint8_t source) {
   }
 
   return false;
-}
-
-uint16_t readLE16(const uint8_t *p) {
-  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-int32_t readLE32s(const uint8_t *p) {
-  uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-  return (int32_t)v;
-}
-
-uint32_t readLE32u(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-int64_t readLE64s(const uint8_t *p) {
-  uint64_t v = 0;
-  for (int i = 7; i >= 0; i--) {
-    v <<= 8;
-    v |= p[i];
-  }
-  return (int64_t)v;
-}
-
-void writeLE16(uint8_t *p, uint16_t v) {
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
-}
-
-void writeLE32(uint8_t *p, uint32_t v) {
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
-  p[2] = (v >> 16) & 0xFF;
-  p[3] = (v >> 24) & 0xFF;
-}
-
-void writeLE64(uint8_t *p, int64_t v) {
-  uint64_t u = (uint64_t)v;
-  for (int i = 0; i < 8; i++) {
-    p[i] = (uint8_t)(u & 0xFF);
-    u >>= 8;
-  }
-}
-
-uint32_t stellariumRaToUint(double raDeg) {
-  raDeg = normalizeRA(raDeg);
-  double v = (raDeg / 360.0) * 4294967296.0;
-  if (v < 0) v = 0;
-  if (v > 4294967295.0) v = 4294967295.0;
-  return (uint32_t)(v + 0.5);
-}
-
-int32_t stellariumDecToInt(double decDeg) {
-  double v = (decDeg / 360.0) * 4294967296.0;
-  if (v < -2147483648.0) v = -2147483648.0;
-  if (v > 2147483647.0) v = 2147483647.0;
-  return (int32_t)(v + (v >= 0 ? 0.5 : -0.5));
-}
-
-double stellariumUintToRaDeg(uint32_t raw) {
-  return normalizeRA(((double)raw / 4294967296.0) * 360.0);
-}
-
-double stellariumIntToDecDeg(int32_t raw) {
-  return ((double)raw / 4294967296.0) * 360.0;
-}
-
-void sendStellariumPosition() {
-  if (!stellariumClient || !stellariumClient.connected()) return;
-  markPositionDemand("Stellarium position TX");
-
-  double ra = 0.0;
-  double dec = 0.0;
-
-  if (!mountPositionApiRaDec(ra, dec, nullptr)) {
-    LOGW("Stellarium position send skipped: no RA/Dec cache");
-    return;
-  }
-
-  uint8_t pkt[24];
-  memset(pkt, 0, sizeof(pkt));
-
-  writeLE16(pkt + 0, 24);
-  writeLE16(pkt + 2, 0); // current position
-  writeLE64(pkt + 4, (int64_t)millis());
-  writeLE32(pkt + 12, stellariumRaToUint(ra));
-  writeLE32(pkt + 16, (uint32_t)stellariumDecToInt(dec));
-  writeLE32(pkt + 20, 0); // status OK/idle
-
-  stellariumClient.write(pkt, sizeof(pkt));
-  stellariumLastTxMs = millis();
-  stellariumTxPackets++;
-  LOG_STEL_D("Stellarium TX position packet #%lu RA=%.6f DEC=%.6f",
-       (unsigned long)stellariumTxPackets, ra, dec);
-}
-
-void handleStellariumPacket(uint8_t *pkt, uint16_t len) {
-  markPositionDemand("Stellarium RX");
-  stellariumLastRxMs = millis();
-  stellariumRxPackets++;
-
-  if (len < 4) {
-    stellariumBadPackets++;
-    LOGW("Stellarium RX bad short packet len=%u", len);
-    return;
-  }
-
-  uint16_t type = readLE16(pkt + 2);
-  LOGD("Stellarium RX packet #%lu len=%u type=%u",
-       (unsigned long)stellariumRxPackets, len, type);
-
-  if (LOG_LEVEL >= LOG_TRACE) {
-    String raw = "Stellarium raw:";
-    for (uint16_t i = 0; i < len && i < 32; i++) {
-      char b[5];
-      snprintf(b, sizeof(b), " %02X", pkt[i]);
-      raw += b;
-    }
-    LOGT("%s", raw.c_str());
-  }
-
-  // Stellarium telescope-control client sends a 20-byte GOTO packet:
-  // uint16 length, uint16 type, int64 time, uint32 RA, int32 DEC.
-  if (len >= 20) {
-    uint32_t rawRa = readLE32u(pkt + 12);
-    int32_t rawDec = readLE32s(pkt + 16);
-
-    double raDeg = stellariumUintToRaDeg(rawRa);
-    double decDeg = stellariumIntToDecDeg(rawDec);
-
-    LOG_STEL_I("Stellarium RX packet len=%u type=%u GOTO RA_deg=%.6f DEC_deg=%.6f",
-         len, type, raDeg, decDeg);
-
-    if (mountCommandPathBusy()) {
-      LOG_STEL_W("Stellarium GOTO queued: mount busy");
-      enqueueGotoRaDec(raDeg, decDeg, LX_SRC_WIFI, "Stellarium GOTO while mount busy");
-    } else {
-      queueAsyncSlew(raDeg, decDeg);
-    }
-
-    // Do not overwrite current-position cache with Stellarium target.
-    markGotoQueueImmediateAck("Stellarium", "binary GOTO accepted; position response sent from cache");
-    sendStellariumPosition();
-    return;
-  }
-
-  stellariumBadPackets++;
-  LOG_STEL_W("Stellarium RX short/unknown packet len=%u type=%u", len, type);
 }
 
 String jsonEscape(const String &s) {
@@ -479,44 +329,6 @@ bool safeFloatValue(const String &v, double &out) {
   return !isnan(out) && !isinf(out);
 }
 
-String formatUptime() {
-  unsigned long seconds = millis() / 1000;
-  unsigned long days = seconds / 86400;
-  seconds %= 86400;
-  unsigned long hours = seconds / 3600;
-  seconds %= 3600;
-  unsigned long minutes = seconds / 60;
-  seconds %= 60;
-
-  String s = "";
-  if (days) s += String(days) + "d ";
-  s += String(hours) + "h ";
-  s += String(minutes) + "m ";
-  s += String(seconds) + "s";
-  return s;
-}
-
-String resetReasonText() {
-#if defined(ESP8266)
-  return ESP.getResetReason();
-#else
-  esp_reset_reason_t r = esp_reset_reason();
-  switch (r) {
-    case ESP_RST_POWERON: return "Power on";
-    case ESP_RST_EXT: return "External reset";
-    case ESP_RST_SW: return "Software reset";
-    case ESP_RST_PANIC: return "Panic/exception";
-    case ESP_RST_INT_WDT: return "Interrupt watchdog";
-    case ESP_RST_TASK_WDT: return "Task watchdog";
-    case ESP_RST_WDT: return "Other watchdog";
-    case ESP_RST_DEEPSLEEP: return "Deep sleep wake";
-    case ESP_RST_BROWNOUT: return "Brownout";
-    case ESP_RST_SDIO: return "SDIO reset";
-    default: return "Unknown";
-  }
-#endif
-}
-
 String basicStatusText() {
   String s;
   s += "MOUNT\n";
@@ -549,85 +361,6 @@ String basicStatusText() {
   return s;
 }
 
-String taskStatsSectionText(bool basicMode);
-
-String basicSystemHealthText() {
-  String s;
-  s += "SCHEDULER\n";
-  s += "Active poll interval: " + String(pollIntervalMs) + " ms\n";
-  s += "Idle poll interval: " + String(idlePollIntervalMs) + " ms\n";
-  s += "Effective poll interval: " + String(effectiveMountPollIntervalMs()) + " ms\n";
-  s += "Position demand: " + String(positionDemandActive() ? "active" : "idle") + "\n";
-  s += "Poll latency current/max: " + String(lastPollSchedulerLatencyMs) + "/" + String(maxPollSchedulerLatencyMs) + " ms\n";
-  s += "Missed poll deadlines: " + String(mountPollsMissedDeadline) + "\n";
-  s += "Mount uptime: " + formatMountUptime() + " h:mm\n";
-  s += "Loop latency current/max: " + String(lastLoopLatencyMs) + "/" + String(maxLoopLatencyMs) + " ms\n";
-  s += "\nRELIABILITY\n";
-  s += "Poll failures: " + String(backgroundPollFailCount) + "\n";
-  s += "Polling auto-disabled: " + String(backgroundPollingAutoDisabled ? "yes" : "no") + "\n";
-  s += "Free heap: " + String(ESP.getFreeHeap()) + " bytes\n";
-  s += "Uptime: " + formatUptime() + "\n";
-  s += "\n";
-  s += taskStatsSectionText(true);
-  s += "\nNETWORK\n";
-  s += "Mode: " + wifiModeText + " / " + String(bridgeModeName()) + "\n";
-  s += "STA: " + String(staConnected && WiFi.status() == WL_CONNECTED ? "connected" : "not connected") + "\n";
-  return s;
-}
-
-String systemHealthText() {
-  String s;
-  s += "=== POLL SCHEDULER ===\n";
-  s += "Policy: fixed interval, highest loop priority\n";
-  s += "Interval: " + String(pollIntervalMs) + " ms\n";
-  s += "Scheduler latency current/max: " + String(lastPollSchedulerLatencyMs) + "/" + String(maxPollSchedulerLatencyMs) + " ms\n";
-  s += "Polls started: " + String(mountPollsStarted) + "\n";
-  s += "Mount uptime: " + formatMountUptime() + " h:mm\n";
-  s += "Deferred while command active: " + String(mountPollsDeferredBusy) + "\n";
-  s += "Missed deadlines: " + String(mountPollsMissedDeadline) + "\n";
-  s += "Background poll failures: " + String(backgroundPollFailCount) + "\n";
-  s += "Polling auto-disabled: " + String(backgroundPollingAutoDisabled ? "yes" : "no") + "\n\n";
-  s += "=== LOOP PERFORMANCE ===\n";
-  s += "Loop latency current/max: " + String(lastLoopLatencyMs) + "/" + String(maxLoopLatencyMs) + " ms\n";
-  s += "Loop execution current/max: " + String(lastLoopTimeMs) + "/" + String(maxLoopTimeMs) + " ms\n";
-  s += "Uptime: " + formatUptime() + "\n\n";
-  s += taskStatsSectionText(false);
-  s += "\n";
-  s += "=== MOUNT TRANSACTIONS ===\n";
-  s += "Single-command discipline: enabled\n";
-  s += "Position cache replies/misses: " + String(positionApiCacheReplies) + "/" + String(positionApiCacheMisses) + "\n";
-  s += "Cached replies while queued/slewing: " + String(queuedGotoPositionCacheReplies) + "\n";
-  s += "LX200 common-router commands: " + String(lx200CommonRouterCommands) + "\n";
-  s += "LX200 GOTO started/completed/stop requests: " + String((unsigned long)lx200GotoUiStartedCount) + "/" + String((unsigned long)lx200GotoUiCompletedCount) + "/" + String((unsigned long)lx200GotoUiStopRequests) + "\n\n";
-  s += "=== GOTO QUEUE ===\n";
-  s += "Active/type: " + String(hasQueuedGoto() ? "yes / " : "no / ") + queuedGotoTypeName(queuedGotoType) + "\n";
-  s += "Accepted/started/timed out/replaced: " + String(gotoQueueAccepted) + "/" + String(gotoQueueStarted) + "/" + String(gotoQueueTimedOut) + "/" + String(gotoQueueReplaced) + "\n";
-  s += "Nudge queue requests: " + String(nudgeGotoQueueRequests) + "\n";
-  s += "Immediate caller ACKs: " + String(gotoQueueImmediateAcks) + "\n";
-  s += "Configured/effective timeout: " + String(gotoQueueTimeoutMs) + "/" + String(effectiveGotoQueueTimeoutMs()) + " ms\n\n";
-  s += "=== MEMORY AND PLATFORM ===\n";
-  s += "Board: " + String(BOARD_NAME) + "\n";
-  s += "CPU: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
-  s += "Free heap: " + String(ESP.getFreeHeap()) + " bytes\n";
-#if defined(ESP32)
-  s += "Minimum free heap: " + String(ESP.getMinFreeHeap()) + " bytes\n";
-#endif
-  s += "Flash/sketch/free sketch: " + String(ESP.getFlashChipSize()) + "/" + String(ESP.getSketchSize()) + "/" + String(ESP.getFreeSketchSpace()) + " bytes\n";
-  s += "Reset reason: " + resetReasonText() + "\n\n";
-  s += "=== NETWORK ===\n";
-  s += "WiFi/bridge mode: " + wifiModeText + " / " + String(bridgeModeName()) + "\n";
-  s += "WiFi status: " + lastWifiStatus + "\n";
-  s += "STA configured/connected: " + String(staConfigured ? "yes" : "no") + "/" + String(staConnected && WiFi.status() == WL_CONNECTED ? "yes" : "no") + "\n";
-  s += "STA SSID/IP: " + staSsid + " / " + WiFi.localIP().toString() + "\n";
-  s += "AP SSID/IP/clients: " + apSsid + " / " + WiFi.softAPIP().toString() + " / " + String(WiFi.softAPgetStationNum()) + "\n\n";
-  s += "=== CLOCK AND PERSISTENCE ===\n";
-  s += "NTP enabled/synced: " + String(ntpEnabled ? "yes" : "no") + "/" + String(ntpSyncValid ? "yes" : "no") + "\n";
-  s += "NTP last-sync age: " + String(lastNtpSyncMs == 0 ? 0 : millis() - lastNtpSyncMs) + " ms\n";
-  s += "Persistent saves: " + String(persistentSaveCount) + "\n";
-  s += "Last save age: " + String(lastPersistentSaveMs == 0 ? 0 : millis() - lastPersistentSaveMs) + " ms\n";
-  s += gpioStartupModeText();
-  return s;
-}
 
 String mountHealthLine() {
   if (mountCommFault) return "Mount Not Responding";
@@ -849,8 +582,6 @@ String tinyEsc(const String &s) {
   return o;
 }
 
-String sampleWebCpuLoadText();
-String sampleBannerSystemText();
 
 String tinyRequestHost(const String &req) {
   int h = req.indexOf("\nHost:");
@@ -1290,7 +1021,7 @@ void sendWebPage() {
   server.sendContent(htmlEscape(staPass));
   server.sendContent(F("'></div><div class='actions'><button onclick='saveWifi()'>Save / Connect STA</button><button onclick='clearWifi()'>Reset WiFi To AP Only</button></div><div class='hint'>When STA is configured, the unit runs STA-only. If STA fails, it falls back to AP-only.</div></div>"));
   server.sendContent(F("<div class='card'><h3>AP Setup</h3><div id='apMsg' class='msg'></div><div class='formrow'><label>AP SSID</label><input id='ap_ssid'></div><div class='formrow'><label>AP Password</label><input id='ap_pass' type='text'></div><div class='formrow'><label>AP IP</label><input id='ap_ip'></div><div class='actions'><button onclick='saveAp()'>Save AP / Server Config</button></div><div class='hint'>Password may be blank/open or at least 8 characters. The AP SSID box shows the full broadcast name.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Nudge Rates</h3><div id='settingsMsg' class='msg'></div><div class='formrow'><label>Rate 1 deg</label><input id='r1'></div><div class='formrow'><label>Rate 2 deg</label><input id='r2'></div><div class='formrow'><label>Rate 3 deg</label><input id='r3'></div><div class='formrow'><label>Rate 4 deg</label><input id='r4'></div><div class='actions'><button onclick='saveRates()'>Save Rates</button><button onclick='resetRates()'>Reset Defaults</button></div></div>")); 
+  server.sendContent(F("<div class='card'><h3>Nudge Rates</h3><div id='settingsMsg' class='msg'></div><div class='formrow'><label>Rate 1 deg</label><input id='r1'></div><div class='formrow'><label>Rate 2 deg</label><input id='r2'></div><div class='formrow'><label>Rate 3 deg</label><input id='r3'></div><div class='formrow'><label>Rate 4 deg</label><input id='r4'></div><div class='actions'><button onclick='saveRates()'>Save Rates</button><button onclick='resetRates()'>Reset Defaults</button></div></div>"));
   server.sendContent(F("<div class='card'><h3>Altitude Safety Limits</h3><div id='altLimitMsg' class='msg'></div><div class='formrow'><label>Enable limit</label><label style='font-weight:normal'><input type='checkbox' id='alt_limit_enable'></label></div><div class='formrow'><label>Minimum Alt deg</label><input id='alt_min' value='0'></div><div class='formrow'><label>Maximum Alt deg</label><input id='alt_max' value='85'></div><div class='actions'><button onclick='saveAltLimits()'>Save Alt Limits</button></div><div class='hint'>Blocks targets too low or too high. Use this to prevent near-zenith tube/mount clearance problems, such as Alt 86 deg.</div></div>"));
   server.sendContent(F("<div class='card'><h3>Connection / Server Config</h3><div id='connCfgMsg' class='msg'></div><div class='hint'>These are saved configuration values. Port changes automatically restart the device.</div><div class='formrow'><label>Web UI HTTP port</label><input id='web_port' disabled></div><div class='formrow'><label>Alpaca HTTP port</label><input id='alpaca_port' disabled></div><div class='formrow'><label>Alpaca Discovery UDP port</label><input id='alpaca_discovery_port' disabled></div><div class='formrow'><label>SkySafari LX200 port</label><input id='lx200_port'></div><div class='formrow'><label>Stellarium port</label><input id='stellarium_port'></div><div class='formrow'><label>Telnet console port</label><input id='telnet_port'></div><div class='formrow'><label>Telnet password</label><input id='telnet_pass' type='text' placeholder='blank disables password'></div><div class='actions'><button onclick='saveConnCfg()'>Save Server Config</button><button onclick='defaultConnCfg()'>Defaults</button></div><div class='hint'>Web UI uses port 80. Alpaca uses its own HTTP listener on port 11111. Discovery uses the separate UDP port shown above. Telnet default is port 23; password changes require reconnect, port changes restart the device.</div></div>"));
   server.sendContent(F("</div>"));
@@ -1893,354 +1624,6 @@ void handleSetLogPage() {
   }
 }
 
-bool decWithinSafeLimits(double decDeg) {
-  if (!safeDecLimitEnabled) return true;
-  return decDeg >= safeDecMinDeg && decDeg <= safeDecMaxDeg;
-}
-
-bool altWithinSafeLimits(double altDeg) {
-  if (altDeg < 0.0) return false;
-  if (!safeAltLimitEnabled) return true;
-  return altDeg >= safeAltMinDeg && altDeg <= safeAltMaxDeg;
-}
-
-bool allowSlewRaDecBySafety(double raDeg, double decDeg, String &reason) {
-  double targetAlt = 0.0;
-  if (!targetAltitudeFromRaDec(raDeg, decDeg, targetAlt)) {
-    reason = "Blocked: valid site/time required for horizon/altitude safety check";
-    return false;
-  }
-
-  if (!altWithinSafeLimits(targetAlt)) {
-    if (targetAlt < 0.0) reason = "Blocked by horizon safety: target Alt ";
-    else reason = "Blocked by Alt safety limit: target Alt ";
-    reason += String(targetAlt, 2);
-    reason += " deg";
-    if (safeAltLimitEnabled && targetAlt >= 0.0) {
-      reason += " allowed ";
-      reason += String(safeAltMinDeg, 2);
-      reason += " to ";
-      reason += String(safeAltMaxDeg, 2);
-    }
-    return false;
-  }
-
-  LOG_MOUNT_D("RA/Dec altitude safety OK: targetRA=%.3f targetDec=%.3f computedAlt=%.3f",
-              normalizeRA(raDeg), decDeg, targetAlt);
-  return true;
-}
-
-bool allowSlewAltAzBySafety(double altDeg, double azDeg, String &reason, double *outRaDeg = nullptr, double *outDecDeg = nullptr) {
-  if (!altWithinSafeLimits(altDeg)) {
-    if (altDeg < 0.0) reason = "Blocked by horizon safety: target Alt ";
-    else reason = "Blocked by Alt safety limit: target Alt ";
-    reason += String(altDeg, 2);
-    reason += " deg";
-    if (safeAltLimitEnabled && altDeg >= 0.0) {
-      reason += " allowed ";
-      reason += String(safeAltMinDeg, 2);
-      reason += " to ";
-      reason += String(safeAltMaxDeg, 2);
-    }
-    return false;
-  }
-
-  if (outRaDeg || outDecDeg) {
-    double r = 0.0, d = 0.0;
-    if (targetRaDecFromAltAz(altDeg, azDeg, r, d)) {
-      if (outRaDeg) *outRaDeg = r;
-      if (outDecDeg) *outDecDeg = d;
-    }
-  }
-
-  LOG_MOUNT_D("Alt/Az altitude safety OK: targetAlt=%.3f targetAz=%.3f",
-              altDeg, normalizeAz(azDeg));
-  return true;
-}
-
-double sanitizeRateValue(double v, double fallback) {
-  if (isnan(v) || v <= 0.0) return fallback;
-  if (v > 5.0) return 5.0;
-  return v;
-}
-
-void handleSetAltLimitsPage() {
-  logHttpRequest("SET_ALT_LIMITS");
-  LOG_SET_I("Setup button pressed: Save Alt Safety Limits");
-
-  bool enabled = server.hasArg("enabled") && server.arg("enabled") == "1";
-  double mn = server.hasArg("min") ? server.arg("min").toFloat() : safeAltMinDeg;
-  double mx = server.hasArg("max") ? server.arg("max").toFloat() : safeAltMaxDeg;
-
-  if (isnan(mn) || isnan(mx) || mn < 0.0 || mx > 90.0 || mn >= mx) {
-    if (wantsAjax()) sendAjaxFail("Invalid Alt limits. Use 0..90 and min < max.");
-    else server.send(400, "text/plain", "Invalid Alt limits");
-    return;
-  }
-
-  safeAltLimitEnabled = enabled;
-  safeAltMinDeg = mn;
-  safeAltMaxDeg = mx;
-  bool ok = savePersistentSettings();
-
-  LOG_SET_I("Alt safety limits %s: min=%.2f max=%.2f save=%s",
-            safeAltLimitEnabled ? "enabled" : "disabled",
-            safeAltMinDeg, safeAltMaxDeg, ok ? "ok" : "failed");
-
-  if (wantsAjax()) {
-    if (ok) sendAjaxOK("Alt safety limits saved");
-    else sendAjaxFail("Alt safety limits changed but save failed");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Redirecting");
-  }
-}
-
-void handleSetDecLimitsPage() {
-  logHttpRequest("SET_DEC_LIMITS_DEPRECATED");
-  safeDecLimitEnabled = false;
-  savePersistentSettings();
-  LOG_SET_W("Deprecated Dec safety limit request ignored; use Altitude Safety Limits instead");
-  if (wantsAjax()) sendAjaxOK("Dec limits are deprecated; use Altitude Safety Limits");
-  else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Redirecting");
-  }
-}
-
-void handleSetRatesPage() {
-  logHttpRequest("SET_RATES");
-  LOG_SET_I("Setup button pressed: Save Rates");
-  if (server.hasArg("r1")) nudgeRateDeg[0] = sanitizeRateValue(server.arg("r1").toFloat(), nudgeRateDeg[0]);
-  if (server.hasArg("r2")) nudgeRateDeg[1] = sanitizeRateValue(server.arg("r2").toFloat(), nudgeRateDeg[1]);
-  if (server.hasArg("r3")) nudgeRateDeg[2] = sanitizeRateValue(server.arg("r3").toFloat(), nudgeRateDeg[2]);
-  if (server.hasArg("r4")) nudgeRateDeg[3] = sanitizeRateValue(server.arg("r4").toFloat(), nudgeRateDeg[3]);
-
-  lx200CurrentNudgeStepDeg = nudgeRateDeg[1];
-
-  savePersistentSettings();
-
-  LOG_SET_D("Nudge rates saved: RS=%.3f RM=%.3f RC=%.3f RG=%.3f",
-       nudgeRateDeg[0], nudgeRateDeg[1], nudgeRateDeg[2], nudgeRateDeg[3]);
-
-  if (wantsAjax()) sendAjaxOK("Nudge rates saved");
-  else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Redirecting");
-  }
-}
-
-void handleSetWebRatePage() {
-  logHttpRequest("SET_WEB_RATE");
-  if (server.hasArg("rate")) {
-    int r = server.arg("rate").toInt();
-    if (r < 1) r = 1;
-    if (r > 4) r = 4;
-    webSelectedRateIndex = r - 1;
-    lx200CurrentNudgeStepDeg = nudgeRateDeg[webSelectedRateIndex];
-    savePersistentSettings();
-    LOGI("Web selected nudge rate changed to %d = %.3f deg",
-         r, nudgeRateDeg[webSelectedRateIndex]);
-  }
-
-  if (wantsAjax()) sendAjaxOK("Selected rate set");
-  else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Redirecting");
-  }
-}
-
-void handleWebNudgePage() {
-  logHttpRequest("WEB_NUDGE");
-  String dir = server.hasArg("dir") ? server.arg("dir") : "";
-  double step = nudgeRateDeg[webSelectedRateIndex];
-
-  double altDelta = 0.0;
-  double azDelta = 0.0;
-
-  if (dir == "n") altDelta = step;
-  else if (dir == "s") altDelta = -step;
-  else if (dir == "e") azDelta = step;
-  else if (dir == "w") azDelta = -step;
-  else {
-    if (wantsAjax()) sendAjaxFail("Bad direction");
-    else server.send(400, "text/plain", "Bad direction");
-    return;
-  }
-
-  if (slewControllerPendingOrRunning()) {
-    if (wantsAjax()) sendAjaxFail("Another mount command is already queued; nudge not queued");
-    else {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "Mount busy");
-    }
-    return;
-  }
-
-  queueAsyncNudge(altDelta, azDelta);
-
-  // Optimistically update the displayed cache so the UI reflects the requested motion.
-  if (altAzCacheValid) {
-    cachedAlt_deg = clampAlt(cachedAlt_deg + altDelta);
-    cachedAz_deg = normalizeAz(cachedAz_deg + azDelta);
-    computeRaDecFromAltAz();
-  }
-
-  if (wantsAjax()) {
-    sendAjaxOK("Nudge queued");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Nudge queued");
-  }
-}
-
-
-void handleGetRaDecWebPage() {
-  logHttpRequest("GET_RADEC_WEB");
-  if (slewControllerPendingOrRunning()) {
-    if (wantsAjax()) sendAjaxFail("Another mount command is already queued; RA/Dec read not queued");
-    else {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "Mount busy");
-    }
-    return;
-  }
-
-  queueAsyncRaDecRead();
-
-  if (wantsAjax()) {
-    sendAjaxOK("RA/Dec read queued");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "RA/Dec read queued");
-  }
-}
-
-void handleGetAltAzWebPage() {
-  logHttpRequest("GET_ALTAZ_WEB");
-  if (slewControllerPendingOrRunning()) {
-    if (wantsAjax()) sendAjaxFail("Another mount command is already queued; Alt/Az read not queued");
-    else {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "Mount busy");
-    }
-    return;
-  }
-
-  queueAsyncAltAzRead();
-
-  if (wantsAjax()) {
-    sendAjaxOK("Alt/Az read queued");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Alt/Az read queued");
-  }
-}
-
-void handleWebGotoRaDecPage() {
-  logHttpRequest("WEB_GOTO_RADEC");
-  double raHours = server.hasArg("ra_hours") ? server.arg("ra_hours").toFloat() : 0.0;
-  double decDeg = server.hasArg("dec_deg") ? server.arg("dec_deg").toFloat() : 0.0;
-  double raDeg = normalizeRA(raHours * 15.0);
-  LOG_MOUNT_D("Web RA/Dec GOTO request safety: dec=%.3f limitEnabled=%d min=%.3f max=%.3f", decDeg, safeDecLimitEnabled ? 1 : 0, safeDecMinDeg, safeDecMaxDeg);
-
-  String safetyReason;
-  if (!allowSlewRaDecBySafety(raDeg, decDeg, safetyReason)) {
-    LOG_MOUNT_W("Web RA/Dec GOTO blocked: %s", safetyReason.c_str());
-    if (wantsAjax()) sendAjaxFail(safetyReason);
-    else server.send(400, "text/plain", safetyReason);
-    return;
-  }
-
-  if (slewControllerPendingOrRunning()) {
-    if (wantsAjax()) sendAjaxFail("Another mount command is already queued; GOTO not queued");
-    else {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "Mount busy");
-    }
-    return;
-  }
-
-  // Queue the RA/Dec GOTO and return immediately. Do NOT overwrite cached/current
-  // position with the target here; the top banner must show actual/current
-  // mount position, not the requested target.
-  markPositionDemand("web RA/Dec GOTO");
-  queueAsyncSlew(raDeg, decDeg);
-
-  if (wantsAjax()) {
-    sendAjaxOK("GOTO RA/Dec queued");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "GOTO RA/Dec queued");
-  }
-}
-
-void handleWebGotoAltAzPage() {
-  logHttpRequest("WEB_GOTO_ALTAZ");
-  double altDeg = server.hasArg("alt_deg") ? server.arg("alt_deg").toFloat() : 0.0;
-  double azDeg = server.hasArg("az_deg") ? server.arg("az_deg").toFloat() : 0.0;
-
-  altDeg = clampAlt(altDeg);
-  azDeg = normalizeAz(azDeg);
-
-  String safetyReason;
-  if (!allowSlewAltAzBySafety(altDeg, azDeg, safetyReason)) {
-    LOG_MOUNT_W("Web Alt/Az GOTO blocked: %s", safetyReason.c_str());
-    if (wantsAjax()) sendAjaxFail(safetyReason);
-    else server.send(400, "text/plain", safetyReason);
-    return;
-  }
-
-  if (slewControllerPendingOrRunning()) {
-    if (wantsAjax()) sendAjaxFail("Another mount command is already queued; Alt/Az GOTO not queued");
-    else {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "Mount busy");
-    }
-    return;
-  }
-
-  // Queue the Alt/Az GOTO and return immediately. Do NOT overwrite cached/current
-  // Alt/Az with the target here; the top banner must remain actual/current
-  // position until the mount reports or the slew completes.
-  markPositionDemand("web Alt/Az GOTO");
-  queueAsyncAltAzSlew(altDeg, azDeg);
-
-  if (wantsAjax()) {
-    sendAjaxOK("GOTO Alt/Az queued");
-  } else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "GOTO Alt/Az queued");
-  }
-}
-
-void handleResetRatesPage() {
-  logHttpRequest("RESET_RATES");
-  LOG_SET_I("Setup button pressed: Reset Rate Defaults");
-  nudgeRateDeg[0] = 0.10;
-  nudgeRateDeg[1] = 0.25;
-  nudgeRateDeg[2] = 0.50;
-  nudgeRateDeg[3] = 1.00;
-  lx200CurrentNudgeStepDeg = nudgeRateDeg[1];
-  webSelectedRateIndex = 1;
-  savePersistentSettings();
-
-  if (wantsAjax()) sendAjaxOK("Rates reset");
-  else {
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Redirecting");
-  }
-}
-
-
-
-
-
-
-
-
-
-
 void handleClearSettingsPage() {
   logHttpRequest("CLEAR_SETTINGS");
   LOG_SET_I("Setup button pressed: Clear Saved Last Location");
@@ -2732,111 +2115,7 @@ void handleMountTestPage() {
   server.send(200, "text/plain", s);
 }
 
-void handleHttpsSetupRedirectPage() {
-  String target = String("https://") + WiFi.softAPIP().toString() + "/";
-  if (WiFi.status() == WL_CONNECTED && !requestCameFromApSubnet()) {
-    target = String("https://") + WiFi.localIP().toString() + "/";
-  }
-  target += "?return=" + urlEncodeSimple(cleanGpsReturnUrl(gpsSyncReturnUrl));
-  sendNoCacheHeaders();
-  server.sendHeader("Connection", "close");
-  server.sendHeader("Location", target);
-  server.send(302, "text/plain", "Redirecting to HTTPS GPS Sync");
-}
 
-
-String urlEncodeSimple(const String &s) {
-  String out;
-  out.reserve(s.length() * 3);
-  const char *hex = "0123456789ABCDEF";
-  for (size_t i = 0; i < s.length(); i++) {
-    uint8_t c = (uint8_t)s[i];
-    if ((c >= 'A' && c <= 'Z') ||
-        (c >= 'a' && c <= 'z') ||
-        (c >= '0' && c <= '9') ||
-        c == '-' || c == '_' || c == '.' || c == '~') {
-      out += (char)c;
-    } else {
-      out += '%';
-      out += hex[(c >> 4) & 0x0F];
-      out += hex[c & 0x0F];
-    }
-  }
-  return out;
-}
-
-String cleanGpsReturnUrl(const String &raw) {
-  String r = raw;
-  r.trim();
-  if (!r.startsWith("http://")) return String("http://") + WiFi.softAPIP().toString() + "/";
-  int scheme = r.indexOf("://");
-  int start = (scheme >= 0) ? scheme + 3 : 0;
-  int slash = r.indexOf('/', start);
-  if (slash < 0) return r + "/";
-  String base = r.substring(0, slash + 1);
-  return base;
-}
-
-String gpsReturnUrlWithCacheBuster() {
-  String r = cleanGpsReturnUrl(gpsSyncReturnUrl);
-  r += "?gpssync_done=";
-  r += String(millis());
-  return r;
-}
-
-void scheduleHttpsSetupStop(unsigned long delayMs) {
-  if (httpsSetupServerHandle) {
-    httpsSetupStopAtMillis = millis() + delayMs;
-  }
-}
-
-void serviceHttpsSetupStop() {
-  if (httpsSetupServerHandle && httpsSetupStopAtMillis != 0 && (long)(millis() - httpsSetupStopAtMillis) >= 0) {
-    httpd_handle_t h = httpsSetupServerHandle;
-    httpsSetupServerHandle = NULL;
-    httpsSetupStopAtMillis = 0;
-    Serial.println("[HTTPS] stopping GPS Sync HTTPS server after completed sync");
-    httpd_ssl_stop(h);
-  }
-}
-
-
-void handleStartHttpsPage() {
-#if defined(ESP32)
-  if (server.hasArg("return")) {
-    String r = urlDecodeSimple(server.arg("return"));
-    if (r.startsWith("http://")) gpsSyncReturnUrl = cleanGpsReturnUrl(r);
-  }
-
-  startHttpsSetupServer();
-
-  String target = String("https://") + WiFi.softAPIP().toString() + "/";
-  if (WiFi.status() == WL_CONNECTED && !requestCameFromApSubnet()) {
-    target = String("https://") + WiFi.localIP().toString() + "/";
-  }
-  target += "?return=" + urlEncodeSimple(cleanGpsReturnUrl(gpsSyncReturnUrl));
-
-  sendNoCacheHeaders();
-  server.sendHeader("Connection", "close");
-
-  if (server.hasArg("json")) {
-    if (httpsSetupServerHandle) {
-      String json = "{\"ok\":true,\"url\":\"" + target + "\"}";
-      server.send(200, "application/json", json);
-    } else {
-      server.send(500, "application/json", "{\"ok\":false,\"error\":\"HTTPS GPS Sync server failed to start\"}");
-    }
-  } else {
-    if (httpsSetupServerHandle) server.send(200, "text/plain", target);
-    else server.send(500, "text/plain", "HTTPS GPS Sync server failed to start");
-  }
-#else
-  sendNoCacheHeaders();
-  server.sendHeader("Connection", "close");
-  if (server.hasArg("json")) server.send(501, "application/json", "{\"ok\":false,\"error\":\"HTTPS only available on ESP32\"}");
-  else server.send(501, "text/plain", "HTTPS only available on ESP32");
-#endif
-}
 
 void handleHttpHealthPage() {
   String s;
@@ -2849,7 +2128,7 @@ void handleHttpHealthPage() {
   s += "STA IP: " + WiFi.localIP().toString() + "\n";
   s += "Bluetooth SkySafari: " + String(bluetoothRuntimeIsEnabled() ? "enabled" : "disabled") + "\n";
   s += "Coex preference: " + bluetoothCoexPreferenceText() + " result=" + String(bluetoothCoexPreferenceResult()) + "\n";
-  s += "HTTPS port: " + String(HTTPS_SETUP_PORT) + "\n";
+  s += "HTTPS port: " + String(httpsSetupPort()) + "\n";
   sendNoCacheHeaders();
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", s);
@@ -2882,27 +2161,6 @@ void handleTimeLocationStatusPage() {
   sendNoCacheHeaders();
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", s);
-}
-
-bool requestCameFromApSubnet() {
-#if defined(ESP32)
-  if (!apRunning) return false;
-  IPAddress rip = server.client().remoteIP();
-  IPAddress ap = WiFi.softAPIP();
-  return rip[0] == ap[0] && rip[1] == ap[1] && rip[2] == ap[2];
-#else
-  return false;
-#endif
-}
-
-void redirectToHttpsSetup443() {
-#if defined(ESP32)
-  String target = String("https://") + WiFi.softAPIP().toString() + "/";
-  server.sendHeader("Location", target);
-  server.send(302, "text/plain", "Redirecting to secure browser time/location setup");
-#else
-  sendWebPage();
-#endif
 }
 
 void sendMinimalWebPage() {
@@ -3397,417 +2655,6 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"Error\":\"Not found\"}");
 }
 
-String consoleLogMaskNames(uint16_t mask) {
-  if (mask == 0) return "none";
-  if ((mask & LOG_CAT_ALL) == LOG_CAT_ALL) return "all";
-
-  String s = "";
-  if (mask & LOG_CAT_MOUNT)      s += "mount,";
-  if (mask & LOG_CAT_SKYSAFARI)  s += "skysafari,";
-  if (mask & LOG_CAT_BLUETOOTH)  s += "bluetooth,";
-  if (mask & LOG_CAT_ALPACA)     s += "alpaca,";
-  if (mask & LOG_CAT_STELLARIUM) s += "stellarium,";
-  if (mask & LOG_CAT_WEB)        s += "web,";
-  if (mask & LOG_CAT_WIFI)       s += "wifi,";
-  if (mask & LOG_CAT_TIMELOC)    s += "time_location,";
-  if (mask & LOG_CAT_SETTINGS)   s += "settings,";
-  if (mask & LOG_CAT_SYSTEM)     s += "system,";
-  if (s.endsWith(",")) s.remove(s.length() - 1);
-  return s.length() ? s : "none";
-}
-
-void printConsoleLogStatus() {
-  Serial.println("Log status:");
-  Serial.printf("  level: %d (%s)\n", LOG_LEVEL, logLevelName(LOG_LEVEL));
-  Serial.printf("  system mask: 0x%04X\n", LOG_SUBSYSTEM_MASK);
-  Serial.print("  systems: ");
-  Serial.println(consoleLogMaskNames(LOG_SUBSYSTEM_MASK));
-}
-
-
-uint16_t consoleLogMaskFromList(String cats) {
-  cats.trim();
-  cats.toLowerCase();
-  cats.replace(",", " ");
-  cats.replace(";", " ");
-  cats.replace("|", " ");
-  cats.replace("+", " ");
-
-  if (cats == "all") return LOG_CAT_ALL;
-  if (cats == "none" || cats == "off" || cats.length() == 0) return 0;
-
-  uint16_t mask = 0;
-  int start = 0;
-  while (start < (int)cats.length()) {
-    while (start < (int)cats.length() && cats.charAt(start) == ' ') start++;
-    if (start >= (int)cats.length()) break;
-
-    int sp = cats.indexOf(' ', start);
-    String part = sp >= 0 ? cats.substring(start, sp) : cats.substring(start);
-    part.trim();
-
-    if (part == "bt") part = "bluetooth";
-    else if (part == "sky") part = "skysafari";
-    else if (part == "safari") part = "skysafari";
-    else if (part == "time") part = "time_location";
-    else if (part == "timeloc") part = "time_location";
-    else if (part == "location") part = "time_location";
-    else if (part == "config") part = "settings";
-    else if (part == "setup") part = "settings";
-    else if (part == "wifi") part = "wifi";
-    else if (part == "wi-fi") part = "wifi";
-
-    uint16_t bit = logCategoryBitFromName(part);
-    if (bit == 0 && part.length() > 0) {
-      Serial.print("[console] unknown log system ignored: ");
-      Serial.println(part);
-    }
-    mask |= bit;
-
-    if (sp < 0) break;
-    start = sp + 1;
-  }
-  return mask;
-}
-
-void printHelpLog() {
-  Serial.println();
-  Serial.println("=== Logging Commands ===");
-  Serial.println("  log");
-  Serial.println("      Show the current log level, subsystem mask, and enabled subsystems.");
-  Serial.println("  log <0..5>");
-  Serial.println("      Set log level:");
-  Serial.println("        0 none   Disable stored/streamed firmware log output.");
-  Serial.println("        1 error  Only failures that usually need action.");
-  Serial.println("        2 warn   Errors plus abnormal/retry/fallback conditions.");
-  Serial.println("        3 info   Normal high-level events: clients, saves, connect/disconnect.");
-  Serial.println("        4 debug  Detailed decisions and state changes for troubleshooting.");
-  Serial.println("        5 trace  Very chatty low-level flow; use briefly, can flood logs.");
-  Serial.println("  log <0..5> [systems]");
-  Serial.println("      Set log level and one or more subsystems separated by spaces or commas.");
-  Serial.println("      Systems: all, none, mount, skysafari, bluetooth, wifi, web, alpaca,");
-  Serial.println("               stellarium, time_location, settings, system");
-  Serial.println("      Aliases: bt=bluetooth, sky/lx200=skysafari, time/location/ntp=time_location,");
-  Serial.println("               config/setup/littlefs=settings, sys=system");
-  Serial.println("      Examples: log 3 system   |   log 4 mount bluetooth   |   log 5 mount,skysafari");
-  Serial.println("      SkySafari position-poll traffic is intentionally suppressed to prevent log flooding.");
-}
-
-void printHelpMode() {
-  Serial.println();
-  Serial.println("=== Mode and Runtime Commands ===");
-  Serial.println("  modebt");
-  Serial.println("      Save BT mode with the small BT web interface enabled, then reboot.");
-  Serial.println("  modebt_telnet | modebt_noweb | modebt_telnetonly");
-  Serial.println("      Save BT Telnet-only mode with the small web interface disabled, then reboot.");
-  Serial.println("  modewifi");
-  Serial.println("      Save Full WiFi mode, then reboot.");
-  Serial.println("  web | web status | webserver | webserver status");
-  Serial.println("      Show the BT web-server runtime state.");
-  Serial.println("  web on | web off | web toggle");
-  Serial.println("      Change the BT web-server runtime state. This is not saved across reboot.");
-  Serial.println("  wifi | wifi status");
-  Serial.println("      Show WiFi runtime, AP/STA connection, and IP information.");
-  Serial.println("  wifi on | wifi off | wifi toggle");
-  Serial.println("      Change WiFi runtime state. In BT mode, Bluetooth remains active when WiFi is off.");
-  Serial.println("  reboot | restart");
-  Serial.println("      Restart the controller immediately.");
-}
-
-void printHelpWifi() {
-  Serial.println();
-  Serial.println("=== WiFi Configuration Commands ===");
-  Serial.println("  setsta <ssid> <password>");
-  Serial.println("      Save STA credentials and immediately attempt a connection.");
-  Serial.println("      SSIDs and passwords containing spaces are not supported by this console command.");
-  Serial.println("  apdefault");
-  Serial.println("      Restore AP SSID, password, and IP defaults, then restart the AP.");
-  Serial.println("  wifi | wifi status");
-  Serial.println("      Show current WiFi and IP status.");
-  Serial.println("  wifi on | wifi off | wifi toggle");
-  Serial.println("      Enable, disable, or toggle WiFi at runtime.");
-  Serial.println("      Use the Full WiFi Setup page for complete STA and AP configuration.");
-}
-
-void printHelpMount() {
-  Serial.println();
-  Serial.println("=== Mount and Polling Commands ===");
-  Serial.println("  testinit");
-  Serial.println("      Test the NexStar '?' handshake and safe E-command payload read.");
-  Serial.println("  get");
-  Serial.println("      Query and print current RA/Dec.");
-  Serial.println("  getaltaz");
-  Serial.println("      Query and print current Alt/Az.");
-  Serial.println("  pos | current_state | currentstate | state");
-  Serial.println("      Print cached telescope coordinates and current bridge state.");
-  Serial.println("  rates");
-  Serial.println("      Show all four nudge rates, mount poll interval, and client-poll throttle.");
-  Serial.println("  mountpoll | mountpoll <ms>");
-  Serial.println("      Get or set the active mount poll interval. 0 turns it off.");
-  Serial.println("  nudge az+ | nudge az- | nudge alt+ | nudge alt-");
-  Serial.println("      Perform one relative Alt/Az nudge using nudge-rate slot 2.");
-  Serial.println("  drain");
-  Serial.println("      Drain and print pending bytes from the mount serial input.");
-}
-
-void printHelpStatus() {
-  Serial.println();
-  Serial.println("=== Status and Diagnostics Commands ===");
-  Serial.println("  status");
-  Serial.println("      Show firmware, mode, network, clients, GOTO queue, heap, loop latency,");
-  Serial.println("      poll scheduler timing, and mount communication status.");
-  Serial.println("  current_state | currentstate | state | pos");
-  Serial.println("      Show current cached telescope coordinates and operational state.");
-  Serial.println("  system_health | systemhealth | health");
-  Serial.println("      Show system-health counters, loop and poll latency, memory, uptime, and errors.");
-  Serial.println("  tasks");
-  Serial.println("      Show FreeRTOS runtime task stats if enabled in the build.");
-  Serial.println("  gpio_startup | gpiostartup | startup_pins");
-  Serial.println("      Show startup mode-pin readings and the selected boot-mode source.");
-  Serial.println("  telnet");
-  Serial.println("      Show Telnet runtime status and counters.");
-  Serial.println("  telnet down | telnet 0");
-  Serial.println("      Stop/unload only the Telnet server; WiFi stays on.");
-  Serial.println("  telnet on | telnet 1");
-  Serial.println("      Start only the Telnet server; WiFi is unchanged.");
-}
-
-void printHelpTopic(const String &topicRaw) {
-  String topic = topicRaw;
-  topic.trim();
-  topic.toLowerCase();
-
-  if (topic == "mount" || topic == "scope" || topic == "nexstar") {
-    printHelpMount();
-  } else if (topic == "mode" || topic == "boot" || topic == "runtime" || topic == "radio") {
-    printHelpMode();
-  } else if (topic == "wifi" || topic == "network") {
-    printHelpWifi();
-  } else if (topic == "log" || topic == "logging" || topic == "logs") {
-    printHelpLog();
-  } else if (topic == "web" || topic == "webserver") {
-    Serial.println();
-    Serial.println("=== Web Server Command ===");
-    Serial.println("  web | web status | webserver | webserver status");
-    Serial.println("      Show the BT web-server runtime state.");
-    Serial.println("  web on | web off | web toggle");
-    Serial.println("      Enable, disable, or toggle the BT web server for this boot only.");
-  } else if (topic == "reboot" || topic == "restart") {
-    Serial.println();
-    Serial.println("=== Reboot Command ===");
-    Serial.println("  reboot | restart");
-    Serial.println("      Restart the controller immediately.");
-  } else if (topic == "testinit") {
-    Serial.println();
-    Serial.println("=== testinit ===");
-    Serial.println("  testinit");
-    Serial.println("      Test the NexStar '?' handshake and safe E-command payload read.");
-  } else if (topic == "get") {
-    Serial.println();
-    Serial.println("=== get ===");
-    Serial.println("  get");
-    Serial.println("      Query the mount and print current RA/Dec.");
-  } else if (topic == "getaltaz") {
-    Serial.println();
-    Serial.println("=== getaltaz ===");
-    Serial.println("  getaltaz");
-    Serial.println("      Query the mount and print current Alt/Az.");
-  } else if (topic == "rates" || topic == "poll" || topic == "mountpoll") {
-    Serial.println();
-    Serial.println("=== Mount Poll / Rates ===");
-    Serial.println("  rates");
-    Serial.println("      Show all four nudge rates, mount poll interval, and client-poll throttle.");
-    Serial.println("  mountpoll | mountpoll <ms>");
-    Serial.println("      Get or set the active mount poll interval. 0 turns it off.");
-  } else if (topic == "nudge") {
-    Serial.println();
-    Serial.println("=== nudge ===");
-    Serial.println("  nudge az+ | nudge az- | nudge alt+ | nudge alt-");
-    Serial.println("      Perform one relative Alt/Az nudge using nudge-rate slot 2.");
-  } else if (topic == "drain") {
-    Serial.println();
-    Serial.println("=== drain ===");
-    Serial.println("  drain");
-    Serial.println("      Drain and print pending bytes from the mount serial input.");
-  } else if (topic == "pos" || topic == "state" || topic == "current_state" || topic == "currentstate") {
-    Serial.println();
-    Serial.println("=== Current State Command ===");
-    Serial.println("  current_state | currentstate | state | pos");
-    Serial.println("      Show cached telescope coordinates and current bridge state.");
-  } else if (topic == "health" || topic == "system_health" || topic == "systemhealth") {
-    Serial.println();
-    Serial.println("=== System Health Command ===");
-    Serial.println("  system_health | systemhealth | health");
-    Serial.println("      Show counters, loop and poll latency, memory, uptime, and errors.");
-  } else if (topic == "tasks") {
-    Serial.println();
-    Serial.println("=== tasks ===");
-    Serial.println("  tasks");
-    Serial.println("      Show FreeRTOS cumulative per-task runtime stats if enabled in this build.");
-    Serial.println("      Serial is one-shot. Telnet task screen is disabled in v5.74.");
-    Serial.println("      Fields: Task=name, Abs Time=cumulative CPU ticks, % Time=CPU share since boot.");
-    Serial.println("      Telnet CPU Load is interval load from IDLE0/IDLE1 deltas; first sample shows --%.");
-    Serial.println("      Common tasks:");
-    Serial.println("        IDLE0/IDLE1 idle tasks for core 0/1; high values mean spare CPU.");
-    Serial.println("        tiT TCP/IP stack; Tmr Svc FreeRTOS software timers.");
-    Serial.println("        ipc0/ipc1 inter-core calls; esp_timer high-resolution timer callbacks.");
-    Serial.println("        wifi WiFi driver; sys_evt ESP system events; arduino_events Arduino events.");
-  } else if (topic == "gpio" || topic == "gpio_startup" || topic == "gpiostartup" || topic == "startup_pins") {
-    Serial.println();
-    Serial.println("=== Startup GPIO Command ===");
-    Serial.println("  gpio_startup | gpiostartup | startup_pins");
-    Serial.println("      Show startup mode-pin readings and selected boot-mode source.");
-  } else if (topic == "telnet") {
-    Serial.println();
-    Serial.println("=== Telnet Status Command ===");
-    Serial.println("  telnet");
-    Serial.println("      Show Telnet port, connection, authentication, and command counters.");
-  } else if (topic == "telnetlog") {
-    Serial.println();
-    Serial.println("=== telnetlog ===");
-    Serial.println("  telnetlog");
-    Serial.println("      Show whether log lines are streamed to the Telnet terminal.");
-    Serial.println("  telnetlog 0");
-    Serial.println("      Turn off log streaming to the Telnet terminal.");
-    Serial.println("  telnetlog 1");
-    Serial.println("      Turn on log streaming to the Telnet terminal.");
-  } else if (topic == "idlepoll") {
-    Serial.println();
-    Serial.println("=== idlepoll ===");
-    Serial.println("  idlepoll | poll idle");
-    Serial.println("      Show idle poll interval and effective poll interval.");
-    Serial.println("  idlepoll <ms> | poll idle <ms>");
-    Serial.println("      Set and save idle poll interval from 0 through 60000 ms.");
-  } else if (topic == "setsta" || topic == "sta") {
-    Serial.println();
-    Serial.println("=== setsta ===");
-    Serial.println("  setsta <ssid> <password>");
-    Serial.println("      Save STA credentials and immediately attempt a connection.");
-    Serial.println("      Spaces in SSID or password are not supported by this command.");
-  } else if (topic == "apdefault" || topic == "ap") {
-    Serial.println();
-    Serial.println("=== apdefault ===");
-    Serial.println("  apdefault");
-    Serial.println("      Restore AP SSID, password, and IP defaults, then restart the AP.");
-  } else {
-    Serial.print("Unknown help topic: ");
-    Serial.println(topicRaw);
-    Serial.println("Grouped topics: mount, mode, wifi");
-    Serial.println("Specific topics: log, web, reboot, testinit, get, getaltaz, rates, mountpoll, nudge,");
-    Serial.println("                 idlepoll, drain, pos, health, tasks, gpio, telnet,");
-    Serial.println("                 telnetlog, setsta, apdefault");
-  }
-}
-
-void printHelp() {
-  Serial.println();
-  Serial.printf("%s %s commands\n", FW_NAME, FW_VERSION);
-  Serial.println("Help:");
-  Serial.println("  help | ? | help mount | help mode | help wifi | help <command>");
-  Serial.println("Status:");
-  Serial.println("  status");
-  Serial.println("  current_state | currentstate | state | pos");
-  Serial.println("  system_health | systemhealth | health");
-  Serial.println("  tasks");
-  Serial.println("  gpio_startup | gpiostartup | startup_pins");
-  Serial.println("  telnet");
-  Serial.println("  telnetlog");
-  Serial.println("Mount:");
-  Serial.println("  testinit | get | getaltaz | rates | drain");
-  Serial.println("  mountpoll | mountpoll <ms>");
-  Serial.println("  idlepoll | idlepoll <ms> | poll idle <ms>");
-  Serial.println("  nudge az+ | nudge az- | nudge alt+ | nudge alt-");
-  Serial.println("Mode:");
-  Serial.println("  modebt");
-  Serial.println("  modebt_telnet | modebt_noweb | modebt_telnetonly");
-  Serial.println("  modewifi");
-  Serial.println("  web [status|on|off|toggle]");
-  Serial.println("  webserver [status|on|off|toggle]");
-  Serial.println("  wifi [status|on|off|toggle]");
-  Serial.println("  reboot | restart");
-  Serial.println("Config:");
-  Serial.println("  setsta <ssid> <password>");
-  Serial.println("  apdefault");
-  Serial.println("  telnetlog 0 | telnetlog 1");
-  Serial.println("  log | log <0..5> [systems]");
-}
-
-
-void printConsoleStatus() {
-  Serial.println();
-  Serial.printf("Firmware: %s %s\n", FW_NAME, FW_VERSION);
-  Serial.printf("Bridge mode: %s\n", bridgeModeName());
-  Serial.printf("Startup mode source: %s\n", startupModeSource.c_str());
-  Serial.printf("Startup mode pin used: %d\n", startupModePinUsed);
-  Serial.printf("WiFi mode: %s\n", wifiModeText.c_str());
-  Serial.printf("WiFi radio active: %d\n", bridgeMode == BRIDGE_MODE_WIFI_FULL ? 1 : 0);
-  Serial.printf("WiFi status: %s\n", lastWifiStatus.c_str());
-  Serial.printf("AP SSID: %s\n", apSsid.c_str());
-  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-  Serial.printf("STA configured: %d\n", staConfigured ? 1 : 0);
-  Serial.printf("STA SSID: %s\n", staSsid.c_str());
-  Serial.printf("STA connected: %d\n", (staConnected && WiFi.status() == WL_CONNECTED) ? 1 : 0);
-  Serial.printf("STA IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Last STA IP: %s\n", lastStaIp.c_str());
-  Serial.printf("Active poll interval: %lu ms\n", pollIntervalMs);
-  Serial.printf("Idle poll interval: %lu ms\n", idlePollIntervalMs);
-  Serial.printf("Effective poll interval: %lu ms (%s)\n",
-                effectiveMountPollIntervalMs(),
-                positionDemandActive() ? "active demand" : "idle");
-  Serial.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
-  Serial.printf("Telnet console: port=%u password=%s client=%s auth=%s commands=%lu authFailures=%lu\n",
-                TELNET_PORT,
-                telnetMaskedPassword().c_str(),
-                (telnetClient && telnetClient.connected()) ? "connected" : "not connected",
-                telnetAuthenticated ? "yes" : "no",
-                (unsigned long)telnetRxCommands,
-                (unsigned long)telnetAuthFailures);
-  Serial.printf("Telnet live logs: %s lines=%lu\n", telnetLiveLogEnabled ? "enabled" : "disabled", (unsigned long)telnetLiveLogLines);
-  Serial.printf("GOTO queue: active=%s type=%s timeout=%lu ms effective=%lu ms accepted=%lu started=%lu timedOut=%lu replaced=%lu immediateAcks=%lu cachedPositionReplies=%lu\n",
-                hasQueuedGoto() ? "yes" : "no",
-                queuedGotoTypeName(queuedGotoType),
-                gotoQueueTimeoutMs,
-                effectiveGotoQueueTimeoutMs(),
-                (unsigned long)gotoQueueAccepted,
-                (unsigned long)gotoQueueStarted,
-                (unsigned long)gotoQueueTimedOut,
-                (unsigned long)gotoQueueReplaced,
-                (unsigned long)gotoQueueImmediateAcks,
-                (unsigned long)queuedGotoPositionCacheReplies);
-  Serial.printf("LX200 UI GOTO: active=%s source=%s started=%lu completed=%lu stopRequests=%lu age=%lu ms\n",
-                lx200GotoUiActive ? "yes" : "no",
-                lx200SourceName(lx200GotoUiSource),
-                (unsigned long)lx200GotoUiStartedCount,
-                (unsigned long)lx200GotoUiCompletedCount,
-                (unsigned long)lx200GotoUiStopRequests,
-                lx200GotoUiActive ? (unsigned long)(millis() - lx200GotoUiStartedMs) : 0UL);
-  Serial.printf("Mount poll active=%lu ms idle=%lu ms effective=%lu ms demand=%s lastPollAge=%lu ms schedulerLatency=%lu/%lu ms started=%lu deferredBusy=%lu missedDeadline=%lu\n",
-                pollIntervalMs,
-                idlePollIntervalMs,
-                effectiveMountPollIntervalMs(),
-                positionDemandActive() ? "active" : "idle",
-                lastMountPollMs == 0 ? 0UL : (unsigned long)(millis() - lastMountPollMs),
-                lastPollSchedulerLatencyMs,
-                maxPollSchedulerLatencyMs,
-                mountPollsStarted,
-                mountPollsDeferredBusy,
-                mountPollsMissedDeadline);
-  Serial.printf("Loop latency current/max=%lu/%lu ms\n", lastLoopLatencyMs, maxLoopLatencyMs);
-  Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-#if defined(ESP32)
-  Serial.printf("Min free heap: %u bytes\n", ESP.getMinFreeHeap());
-#endif
-#if HAS_CLASSIC_BT
-  Serial.printf("Bluetooth enabled: %d\n", bluetoothRuntimeIsEnabled() ? 1 : 0);
-  Serial.printf("Bluetooth client: %d\n", bluetoothClientConnected() ? 1 : 0);
-#else
-  Serial.println("Bluetooth enabled: 0");
-#endif
-  Serial.printf("Mount fault: %d busy: %d\n", mountCommFault ? 1 : 0, mountBusy ? 1 : 0);
-  Serial.println();
-}
-
-
 class TelnetCRLFPrint : public Print {
 public:
   // Buffer terminal output so borders, padded rows, and ANSI sequences are sent
@@ -3864,6 +2711,10 @@ String telnetMaskedPassword() {
   return String("(set, ") + String(telnetPassword.length()) + " chars)";
 }
 
+bool telnetFullUiAllowed() {
+  return bridgeMode == BRIDGE_MODE_WIFI_FULL;
+}
+
 void telnetPrintHelp(Print &out) {
   out.println();
   out.printf("%s %s commands\n", FW_NAME, FW_VERSION);
@@ -3892,7 +2743,11 @@ void telnetPrintHelp(Print &out) {
   out.println("  apdefault");
   out.println("  setsta <ssid> <password>");
   out.println("  log | log 0..5 [systems]");
-  out.println("Disabled in Telnet v5.74: menu/ui, monitor, tasks, telnetlog.");
+  if (telnetFullUiAllowed()) {
+    out.println("Full Telnet UI: menu | monitor [s|ms] | tasks [s|ms] | telnetlog [0|1]");
+  } else {
+    out.println("BT Telnet mode: menu/ui, monitor, tasks, and telnetlog are disabled.");
+  }
 }
 
 void telnetPrintStatus(Print &out) {
@@ -3950,393 +2805,7 @@ void telnetPrintStatus(Print &out) {
   out.println("=== End Status ===");
 }
 
-void printTaskStatsHeader(Print &out) {
-  out.printf("%-16s%-14s%s\n", "Task", "Abs Time", "% Time");
-}
 
-bool parseTaskStatsLine(const char *line, char *taskName, size_t taskNameSize, unsigned long &absTime, char *percentTime, size_t percentSize) {
-  if (!line || !*line || taskNameSize == 0 || percentSize == 0) return false;
-  taskName[0] = '\0';
-  percentTime[0] = '\0';
-  absTime = 0;
-
-  const char *nameStart = line;
-  while (*nameStart == ' ' || *nameStart == '\t') nameStart++;
-  const char *tab = strchr(nameStart, '\t');
-  if (tab) {
-    const char *nameEnd = tab;
-    while (nameEnd > nameStart && (*(nameEnd - 1) == ' ' || *(nameEnd - 1) == '\t')) nameEnd--;
-    size_t nameLen = (size_t)(nameEnd - nameStart);
-    if (nameLen >= taskNameSize) nameLen = taskNameSize - 1;
-    memcpy(taskName, nameStart, nameLen);
-    taskName[nameLen] = '\0';
-
-    const char *p = tab + 1;
-    while (*p == ' ' || *p == '\t') p++;
-    char *endPtr = nullptr;
-    absTime = strtoul(p, &endPtr, 10);
-    if (endPtr == p) return false;
-    p = endPtr;
-    while (*p == ' ' || *p == '\t') p++;
-    size_t pctLen = 0;
-    while (p[pctLen] && p[pctLen] != ' ' && p[pctLen] != '\t' && p[pctLen] != '\r' && p[pctLen] != '\n') pctLen++;
-    if (pctLen >= percentSize) pctLen = percentSize - 1;
-    memcpy(percentTime, p, pctLen);
-    percentTime[pctLen] = '\0';
-    return taskName[0] && percentTime[0];
-  }
-
-  return sscanf(line, " %23s %lu %15s", taskName, &absTime, percentTime) == 3;
-}
-
-bool taskStatsIncludeInBasic(const char *taskName) {
-  return strcmp(taskName, "loopTask") == 0 ||
-         strcmp(taskName, "IDLE0") == 0 ||
-         strcmp(taskName, "IDLE1") == 0;
-}
-
-void appendTaskStatsRow(String &s, const char *taskName, unsigned long absTime, const char *percentTime) {
-  char row[72];
-  snprintf(row, sizeof(row), "%-16s%-14lu%s\n", taskName, absTime, percentTime);
-  s += row;
-}
-
-String taskStatsSectionText(bool basicMode) {
-  String s;
-  s += basicMode ? "TASKS\n" : "=== TASKS ===\n";
-  s += "Task            Abs Time      % Time\n";
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
-  static char taskStats[2048];
-  memset(taskStats, 0, sizeof(taskStats));
-  vTaskGetRunTimeStats(taskStats);
-
-  bool printedAny = false;
-  char *line = taskStats;
-  while (line && *line) {
-    char *next = line;
-    while (*next && *next != '\n' && *next != '\r') next++;
-    char saved = *next;
-    *next = '\0';
-
-    char taskName[24] = "";
-    char percentTime[16] = "";
-    unsigned long absTime = 0;
-    if (parseTaskStatsLine(line, taskName, sizeof(taskName), absTime, percentTime, sizeof(percentTime)) &&
-        (!basicMode || taskStatsIncludeInBasic(taskName))) {
-      appendTaskStatsRow(s, taskName, absTime, percentTime);
-      printedAny = true;
-    }
-
-    if (!saved) break;
-    line = next + 1;
-    while (*line == '\n' || *line == '\r') line++;
-  }
-  if (!printedAny) s += basicMode ? "loopTask/IDLE0/IDLE1 unavailable\n" : "No task rows available\n";
-#else
-  s += "FreeRTOS runtime stats are not enabled in this build.\n";
-#endif
-  return s;
-}
-
-void printTaskStatsLine(Print &out, const char *line) {
-  char taskName[24] = "";
-  unsigned long absTime = 0;
-  char percentTime[16] = "";
-  if (parseTaskStatsLine(line, taskName, sizeof(taskName), absTime, percentTime, sizeof(percentTime))) {
-    out.printf("%-16s%-14lu%s\n", taskName, absTime, percentTime);
-  } else if (line && *line) {
-    out.println(line);
-  }
-}
-
-void updateTelnetTasksCpuLoad(char *taskStats) {
-  unsigned long idle0 = 0;
-  unsigned long idle1 = 0;
-  unsigned long total = 0;
-  bool foundIdle0 = false;
-  bool foundIdle1 = false;
-  const char *p = taskStats;
-  while (p && *p) {
-    char line[128] = "";
-    size_t len = 0;
-    while (p[len] && p[len] != '\n' && p[len] != '\r' && len < sizeof(line) - 1) len++;
-    memcpy(line, p, len);
-    line[len] = '\0';
-
-    char taskName[24] = "";
-    char percentTime[16] = "";
-    unsigned long absTime = 0;
-    if (parseTaskStatsLine(line, taskName, sizeof(taskName), absTime, percentTime, sizeof(percentTime))) {
-      total += absTime;
-      if (strcmp(taskName, "IDLE0") == 0) {
-        idle0 = absTime;
-        foundIdle0 = true;
-      } else if (strcmp(taskName, "IDLE1") == 0) {
-        idle1 = absTime;
-        foundIdle1 = true;
-      }
-    }
-
-    p += len;
-    while (*p == '\n' || *p == '\r') p++;
-  }
-
-  if (foundIdle0 && foundIdle1 && telnetTasksLastLoadMs > 0 &&
-      idle0 >= telnetTasksLastIdle0 && idle1 >= telnetTasksLastIdle1 && total > telnetTasksLastRuntimeTotal) {
-    unsigned long idleDelta = (idle0 - telnetTasksLastIdle0) + (idle1 - telnetTasksLastIdle1);
-    unsigned long totalDelta = total - telnetTasksLastRuntimeTotal;
-    int loadPct = 100 - (int)((idleDelta * 100UL) / totalDelta);
-    if (loadPct < 0) loadPct = 0;
-    if (loadPct > 100) loadPct = 100;
-    telnetTasksCpuLoadPct = loadPct;
-  } else {
-    telnetTasksCpuLoadPct = -1;
-  }
-
-  if (foundIdle0 && foundIdle1) {
-    telnetTasksLastIdle0 = idle0;
-    telnetTasksLastIdle1 = idle1;
-    telnetTasksLastRuntimeTotal = total;
-    telnetTasksLastLoadMs = millis();
-  }
-}
-
-String sampleWebCpuLoadText() {
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
-  static char taskStats[2048];
-  memset(taskStats, 0, sizeof(taskStats));
-  vTaskGetRunTimeStats(taskStats);
-
-  unsigned long idle0 = 0;
-  unsigned long idle1 = 0;
-  unsigned long total = 0;
-  bool foundIdle0 = false;
-  bool foundIdle1 = false;
-  char *line = taskStats;
-  while (line && *line) {
-    char *next = line;
-    while (*next && *next != '\n' && *next != '\r') next++;
-    char saved = *next;
-    *next = '\0';
-
-    char taskName[24] = "";
-    char percentTime[16] = "";
-    unsigned long absTime = 0;
-    if (parseTaskStatsLine(line, taskName, sizeof(taskName), absTime, percentTime, sizeof(percentTime))) {
-      total += absTime;
-      if (strcmp(taskName, "IDLE0") == 0) {
-        idle0 = absTime;
-        foundIdle0 = true;
-      } else if (strcmp(taskName, "IDLE1") == 0) {
-        idle1 = absTime;
-        foundIdle1 = true;
-      }
-    }
-
-    if (!saved) break;
-    line = next + 1;
-    while (*line == '\n' || *line == '\r') line++;
-  }
-
-  if (foundIdle0 && foundIdle1 && webCpuLastRuntimeTotal > 0 &&
-      idle0 >= webCpuLastIdle0 && idle1 >= webCpuLastIdle1 && total > webCpuLastRuntimeTotal) {
-    unsigned long idleDelta = (idle0 - webCpuLastIdle0) + (idle1 - webCpuLastIdle1);
-    unsigned long totalDelta = total - webCpuLastRuntimeTotal;
-    int loadPct = 100 - (int)((idleDelta * 100UL) / totalDelta);
-    if (loadPct < 0) loadPct = 0;
-    if (loadPct > 100) loadPct = 100;
-    webCpuLoadPct = loadPct;
-  } else {
-    webCpuLoadPct = -1;
-  }
-
-  if (foundIdle0 && foundIdle1) {
-    webCpuLastIdle0 = idle0;
-    webCpuLastIdle1 = idle1;
-    webCpuLastRuntimeTotal = total;
-  }
-#endif
-  if (webCpuLoadPct < 0) return "CPU Load --%";
-  return String("CPU Load ") + String(webCpuLoadPct) + "%";
-}
-
-
-String sampleBannerSystemText() {
-  // Refresh the interval CPU load and then collect the current FreeRTOS
-  // percentages for the three tasks most useful in the compact banner.
-  String cpuText = sampleWebCpuLoadText();
-  cpuText.replace("CPU Load ", "");
-
-  char loopPct[8] = "--%";
-  char idle0Pct[8] = "--%";
-  char idle1Pct[8] = "--%";
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
-  static char taskStats[2048];
-  memset(taskStats, 0, sizeof(taskStats));
-  vTaskGetRunTimeStats(taskStats);
-  char *line = taskStats;
-  while (line && *line) {
-    char *next = line;
-    while (*next && *next != '\n' && *next != '\r') next++;
-    char saved = *next;
-    *next = '\0';
-
-    char taskName[24] = "";
-    char percentTime[16] = "";
-    unsigned long absTime = 0;
-    if (parseTaskStatsLine(line, taskName, sizeof(taskName), absTime,
-                           percentTime, sizeof(percentTime))) {
-      char *dest = nullptr;
-      if (strcmp(taskName, "loopTask") == 0) dest = loopPct;
-      else if (strcmp(taskName, "IDLE0") == 0) dest = idle0Pct;
-      else if (strcmp(taskName, "IDLE1") == 0) dest = idle1Pct;
-      if (dest) {
-        strncpy(dest, percentTime, 7);
-        dest[7] = '\0';
-      }
-    }
-
-    if (!saved) break;
-    line = next + 1;
-    while (*line == '\n' || *line == '\r') line++;
-  }
-#endif
-
-  char row[72];
-  // Compact labels keep all four values visible in a standard 79-column
-  // Windows Telnet session. Values are percentages.
-  // Keep related scheduler values together and use stable short labels.
-  // Example: CPU:12% Loop:1% I0:48% I1:49%
-  snprintf(row, sizeof(row), "CPU:%s Loop:%s I0:%s I1:%s",
-           cpuText.c_str(), loopPct, idle0Pct, idle1Pct);
-  return String(row);
-}
-
-String taskCpuLoadText() {
-  if (telnetTasksCpuLoadPct < 0) return "CPU Load --%";
-  return String("CPU Load ") + String(telnetTasksCpuLoadPct) + "%";
-}
-
-String taskRefreshText();
-
-void printTasksBanner(Print &out) {
-  String left = String(FW_VERSION) + " Tasks  Up " + formatUptime() + "  Refresh " + taskRefreshText();
-  out.println(left);
-}
-
-void printFormattedTaskRuntimeStats(Print &out, char *taskStats) {
-  printTaskStatsHeader(out);
-  char *line = taskStats;
-  while (line && *line) {
-    char *next = line;
-    while (*next && *next != '\n' && *next != '\r') next++;
-    char saved = *next;
-    *next = '\0';
-    printTaskStatsLine(out, line);
-    if (!saved) break;
-    line = next + 1;
-    while (*line == '\n' || *line == '\r') line++;
-  }
-}
-
-void printTaskRuntimeStats(Print &out) {
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
-  static char taskStats[2048];
-  memset(taskStats, 0, sizeof(taskStats));
-  vTaskGetRunTimeStats(taskStats);
-  out.println("=== FreeRTOS Runtime Stats ===");
-  out.println("Task runtime percentages are cumulative since boot.");
-  printFormattedTaskRuntimeStats(out, taskStats);
-  out.println("=== End Runtime Stats ===");
-#else
-  out.println("FreeRTOS runtime stats are not enabled in this build.");
-  out.println("Required: configGENERATE_RUN_TIME_STATS=1 and configUSE_STATS_FORMATTING_FUNCTIONS=1.");
-  out.println("Command is compiled as a safe no-op unless those options are available.");
-#endif
-}
-
-String taskRefreshText() {
-  if (telnetTasksRefreshMs % 1000UL == 0) return String(telnetTasksRefreshMs / 1000UL) + "s";
-  return String(telnetTasksRefreshMs) + "ms";
-}
-
-bool consoleConfirmYes(const String &cmd) {
-  return cmd == "y" || cmd == "yes";
-}
-
-bool consoleConfirmNo(const String &cmd) {
-  return cmd == "n" || cmd == "no";
-}
-
-bool commandRequiresDisconnectConfirm(const String &cmd, bool telnetSession, String &description) {
-  if (cmd == "reboot" || cmd == "restart") {
-    description = "This command will reboot the controller.";
-    return true;
-  }
-  if (cmd == "wifi off") {
-    description = "This command will turn WiFi off and may disconnect clients.";
-    return true;
-  }
-  if (cmd == "wifi toggle" && wifiRuntimeEnabled) {
-    description = "This command will turn WiFi off and may disconnect clients.";
-    return true;
-  }
-  if (cmd == "modebt" ||
-      cmd == "modebt_telnet" || cmd == "modebt_noweb" || cmd == "modebt_telnetonly" ||
-      cmd == "modewifi") {
-    description = "This command will save boot mode and reboot the controller.";
-    return true;
-  }
-  if (cmd == "apdefault") {
-    description = "This command will restart the AP/radio path and may disconnect clients.";
-    return true;
-  }
-  if (cmd.startsWith("setsta ")) {
-    description = "This command will change STA WiFi and may disconnect clients.";
-    return true;
-  }
-  if (telnetSession && (cmd == "exit" || cmd == "quit")) {
-    description = "This command will close the Telnet session.";
-    return true;
-  }
-  return false;
-}
-
-void printCommandConfirmPrompt(Print &out, const String &line, const String &description) {
-  out.println(description);
-  out.print("Run '");
-  out.print(line);
-  out.println("'? y/n");
-}
-
-void printMountPollValue(Print &out) {
-  out.printf("mountpoll=%lu ms%s\n", pollIntervalMs, pollIntervalMs == 0 ? " (off)" : "");
-}
-
-bool setMountPollValue(long valueMs) {
-  if (valueMs < 0) valueMs = 0;
-  if (valueMs > 60000) valueMs = 60000;
-  pollIntervalMs = (unsigned long)valueMs;
-  resetMountPollScheduler();
-  return savePersistentSettings();
-}
-
-String formatAgeSeconds(unsigned long timestampMs) {
-  if (timestampMs == 0) return "never";
-  unsigned long s = (millis() - timestampMs) / 1000UL;
-  if (s < 60UL) return String(s) + "s";
-  unsigned long m = s / 60UL;
-  s %= 60UL;
-  if (m < 60UL) return String(m) + "m" + twoDigits(s) + "s";
-  unsigned long h = m / 60UL;
-  m %= 60UL;
-  return String(h) + "h" + twoDigits(m) + "m";
-}
-
-String monitorRefreshText() {
-  if (telnetMonitorRefreshMs % 1000UL == 0) return String(telnetMonitorRefreshMs / 1000UL) + "s";
-  return String(telnetMonitorRefreshMs) + "ms";
-}
 
 unsigned long parseMonitorRefreshMs(const String &cmd) {
   if (cmd == "monitor") return 2000UL;
@@ -4382,90 +2851,6 @@ unsigned long parseIntervalArgumentMs(const String &cmd, const String &commandNa
   return ms;
 }
 
-void telnetDrawMonitor(Print &out) {
-  bool btConnected = false;
-#if HAS_CLASSIC_BT
-  btConnected = bluetoothClientConnected();
-#endif
-  bool skyWifiConnected = lx200Client && lx200Client.connected();
-  bool stelConnected = stellariumClient && stellariumClient.connected();
-  const char* mountStateShort = mountCommFault ? "Fault" : ((mountBusy || asyncSlewRunning || asyncSlewPending) ? "Busy" : (lastMountResponseMs > 0 ? "Connected" : "Unknown"));
-
-  out.print("\x1B[H");
-  out.printf("%-20s %-10s %-8s %-12s %-8s %-8s\n",
-             FW_NAME,
-             FW_VERSION,
-             "Uptime",
-             formatUptime().c_str(),
-             "Refresh",
-             monitorRefreshText().c_str());
-  out.println("q / Enter / Ctrl-C exits");
-  out.println("----------------------------------------------------------------------------");
-  out.printf("%-12s %-12s %-12s %-12s %-12s %-12s\n", "MOUNT", "FAULT", "MOUNT UP", "LAST POLL", "TX", "RX");
-  out.printf("%-12s %-12s %-12s %-12s %-12lu %-12lu\n",
-             mountStateShort,
-             mountCommFault ? "yes" : "no",
-             formatMountUptime().c_str(),
-             lastSuccessfulMountPollMs == 0 ? "none" : (twoDigits(lastSuccessfulMountPollHour) + ":" + twoDigits(lastSuccessfulMountPollMinute) + ":" + twoDigits(lastSuccessfulMountPollSecond)).c_str(),
-             mountPollsStarted,
-             mountPollsSucceeded);
-  out.println();
-  out.printf("%-12s %-12s %-12s %-12s %-12s\n", "ALT", "AZ", "MOUNTPOLL", "IDLEPOLL", "CURRENT POLL");
-  out.printf("%-12.6f %-12.6f %-12s %-12s %-12s\n",
-             mountCurrentAlt_deg,
-             mountCurrentAz_deg,
-             (String(pollIntervalMs) + " ms").c_str(),
-             (String(idlePollIntervalMs) + " ms").c_str(),
-             (String(effectiveMountPollIntervalMs()) + " ms").c_str());
-  out.println();
-  out.printf("%-24s %-24s %-20s\n", "POLLS STARTED", "POLLS MISSED", "LOGS");
-  out.printf("%-24lu %-24lu %-20s\n",
-             mountPollsStarted,
-             mountPollsMissedDeadline,
-             telnetMonitorActive ? (telnetMonitorSavedLiveLog ? "paused/on" : "paused/off") : (telnetLiveLogEnabled ? "on" : "off"));
-  out.println();
-  out.printf("%-12s %-12s %-12s %-12s %-12s\n", "CLIENT", "STATE", "TX", "RX", "ERRORS");
-  out.printf("%-12s %-12s %-12lu %-12lu %-12lu\n",
-             "Sky WiFi",
-             skyWifiConnected ? "connected" : "idle",
-             lx200WifiTxReplies,
-             lx200WifiRxCommands,
-             lx200WifiUnhandledCommands);
-  out.printf("%-12s %-12s %-12lu %-12lu %-12lu\n",
-             "Sky BT",
-             btConnected ? "connected" : (bluetoothRuntimeIsEnabled() ? "waiting" : "disabled"),
-             lx200BtTxReplies,
-             lx200BtRxCommands,
-             lx200BtUnhandledCommands);
-  out.printf("%-12s %-12s %-12lu %-12lu %-12lu\n",
-             "Stellarium",
-             stelConnected ? "connected" : "idle",
-             stellariumTxPackets,
-             stellariumRxPackets,
-             stellariumBadPackets);
-  out.printf("%-12s %-12s %-12s %-12lu %-12s\n",
-             "Alpaca",
-             alpacaConnected ? "active" : "idle",
-             "-",
-             alpacaHttpRequests,
-             "-");
-  out.println();
-  out.printf("%-12s %-12s %-12s %-12s\n", "HEAP", "MIN HEAP", "LOOP", "MAX LOOP");
-  out.printf("%-12u %-12u %-12s %-12s\n",
-             ESP.getFreeHeap(),
-#if defined(ESP32)
-             ESP.getMinFreeHeap(),
-#else
-             0,
-#endif
-             (String(lastLoopLatencyMs) + " ms").c_str(),
-             (String(maxLoopLatencyMs) + " ms").c_str());
-  out.println();
-  out.println("FAULT DETAIL");
-  out.printf("%.76s\n", lastMountFault.length() ? lastMountFault.c_str() : "none");
-  out.print("\x1B[J");
-}
-
 void telnetStartMonitor(Print &out, unsigned long refreshMs) {
   telnetMonitorRefreshMs = refreshMs;
   telnetMonitorSavedLiveLog = telnetLiveLogEnabled;
@@ -4482,32 +2867,6 @@ void telnetStopMonitor(Print &out) {
   out.print("\x1B[?25h");
   out.println();
   out.println("Monitor stopped.");
-}
-
-void telnetDrawTasks(Print &out) {
-  out.print("\x1B[H");
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
-  static char taskStats[2048];
-  memset(taskStats, 0, sizeof(taskStats));
-  vTaskGetRunTimeStats(taskStats);
-  updateTelnetTasksCpuLoad(taskStats);
-  printTasksBanner(out);
-  out.println("q / Enter / Ctrl-C exits. Runtime percentages are cumulative since boot.");
-  out.println("----------------------------------------------------------------------------");
-  out.println(taskCpuLoadText());
-  printFormattedTaskRuntimeStats(out, taskStats);
-#else
-  printTasksBanner(out);
-  out.println("q / Enter / Ctrl-C exits. Runtime percentages are cumulative since boot.");
-  out.println("----------------------------------------------------------------------------");
-  out.println("FreeRTOS runtime stats are not enabled in this build.");
-  out.println("Required:");
-  out.println("  configGENERATE_RUN_TIME_STATS=1");
-  out.println("  configUSE_STATS_FORMATTING_FUNCTIONS=1");
-  out.println();
-  out.println("The command is present as a safe no-op until those options are available.");
-#endif
-  out.print("\x1B[J");
 }
 
 void telnetStartTasks(Print &out, unsigned long refreshMs) {
@@ -4532,44 +2891,6 @@ void telnetStopTasks(Print &out) {
   out.print("\x1B[?25h");
   out.println();
   out.println("Tasks stopped.");
-}
-
-void printConsoleHealth(Print &out) {
-  out.println("=== System Health ===");
-  out.println("POLL SCHEDULER");
-  out.printf("Active/idle/effective poll: %lu/%lu/%lu ms\n",
-             pollIntervalMs,
-             idlePollIntervalMs,
-             effectiveMountPollIntervalMs());
-  out.printf("Poll latency current/max: %lu/%lu ms\n",
-             lastPollSchedulerLatencyMs,
-             maxPollSchedulerLatencyMs);
-  out.printf("Missed deadlines: %lu\n", mountPollsMissedDeadline);
-  out.printf("Poll failures: %lu auto-disabled=%s\n",
-             backgroundPollFailCount,
-             backgroundPollingAutoDisabled ? "yes" : "no");
-  out.printf("Mount uptime: %s h:mm\n", formatMountUptime().c_str());
-  out.println();
-  out.println("LOOP");
-  out.printf("Loop latency current/max: %lu/%lu ms\n", lastLoopLatencyMs, maxLoopLatencyMs);
-  out.printf("Loop execution current/max: %lu/%lu ms\n", lastLoopTimeMs, maxLoopTimeMs);
-  out.printf("Uptime: %s\n", formatUptime().c_str());
-  out.println();
-  out.println("MEMORY");
-  out.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-#if defined(ESP32)
-  out.printf("Minimum free heap: %u bytes\n", ESP.getMinFreeHeap());
-  out.printf("Largest free block: %u bytes\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  out.printf("Heap integrity: %s\n", heap_caps_check_integrity_all(false) ? "ok" : "FAILED");
-  out.printf("Loop-task stack high-water: %u words\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
-#endif
-  out.printf("Reset reason: %s\n", resetReasonText().c_str());
-  out.println();
-  out.println("NETWORK");
-  out.printf("WiFi/bridge mode: %s / %s\n", wifiModeText.c_str(), bridgeModeName());
-  out.printf("STA connected: %s\n", (staConnected && WiFi.status() == WL_CONNECTED) ? "yes" : "no");
-  out.printf("AP clients: %d\n", WiFi.softAPgetStationNum());
-  out.println("=== End System Health ===");
 }
 
 void printTelnetRuntimeStatus(Print &out) {
@@ -4673,7 +2994,14 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  Show counters, latency, memory, uptime, and errors.");
     } else if (topic == "tasks") {
       out.println("tasks");
-      out.println("  Telnet FreeRTOS task screen is disabled in v5.74.");
+      if (telnetFullUiAllowed()) {
+        out.println("tasks [seconds|millisecondsms]");
+        out.println("  Show FreeRTOS cumulative per-task runtime stats in place.");
+        out.println("  Default refresh is 5 seconds. Examples: tasks | tasks 10 | tasks 1500ms");
+        out.println("  Press q, Enter, or Ctrl-C to exit.");
+      } else {
+        out.println("  Telnet FreeRTOS task screen is disabled in BT Telnet mode.");
+      }
     } else if (topic == "gpio" || topic == "gpio_startup" || topic == "gpiostartup" || topic == "startup_pins") {
       out.println("gpio_startup | gpiostartup | startup_pins");
       out.println("  Show startup mode-pin readings and boot-mode source.");
@@ -4685,10 +3013,25 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  These commands do not change WiFi state.");
     } else if (topic == "monitor") {
       out.println("monitor");
-      out.println("  Telnet monitor screen is disabled in v5.74; use status.");
+      if (telnetFullUiAllowed()) {
+        out.println("monitor [seconds|millisecondsms]");
+        out.println("  Start a live in-place Telnet status view. Default refresh is 2 seconds.");
+        out.println("  Examples: monitor | monitor 5 | monitor 750ms");
+        out.println("  Press q, Enter, or Ctrl-C to exit.");
+      } else {
+        out.println("  Telnet monitor screen is disabled in BT Telnet mode; use status.");
+      }
     } else if (topic == "telnetlog") {
       out.println("telnetlog");
-      out.println("  Telnet live logging is disabled in v5.74.");
+      if (telnetFullUiAllowed()) {
+        out.println("  Show whether log lines are streamed to the Telnet terminal.");
+        out.println("telnetlog 0");
+        out.println("  Turn off log streaming to the Telnet terminal.");
+        out.println("telnetlog 1");
+        out.println("  Turn on log streaming to the Telnet terminal.");
+      } else {
+        out.println("  Telnet live logging is disabled in BT Telnet mode.");
+      }
     } else if (topic == "idlepoll") {
       out.println("idlepoll | poll idle");
       out.println("  Show idle poll interval and effective poll interval.");
@@ -4709,20 +3052,41 @@ void telnetRunCommand(String line, Print &out) {
     }
   }
   else if (cmd == "menu" || cmd == "ui") {
-    out.println("ANSI Telnet menu is disabled in v5.74; use plain commands.");
+    if (telnetFullUiAllowed()) telnetStartMenu(out);
+    else out.println("ANSI Telnet menu is disabled in BT Telnet mode; use plain commands.");
   }
   else if (cmd == "menu size" || cmd == "ui size") {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      out.printf("Telnet menu size: %u cols x %u rows%s\n",
+                 telnetGetMenuTerminalColumns(),
+                 telnetGetMenuTerminalRows(),
+                 telnetMenuSizeFromNaws() ? " (NAWS)" : " (manual/default)");
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd.startsWith("menu rows ") || cmd.startsWith("ui rows ")) {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      int sp = cmd.lastIndexOf(' ');
+      telnetSetMenuTerminalSize(telnetGetMenuTerminalColumns(), (uint16_t)cmd.substring(sp + 1).toInt());
+      out.printf("Telnet menu rows: %u\n", telnetGetMenuTerminalRows());
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd.startsWith("menu cols ") || cmd.startsWith("ui cols ")) {
-    out.println("ANSI Telnet menu is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      int sp = cmd.lastIndexOf(' ');
+      telnetSetMenuTerminalSize((uint16_t)cmd.substring(sp + 1).toInt(), telnetGetMenuTerminalRows());
+      out.printf("Telnet menu columns: %u\n", telnetGetMenuTerminalColumns());
+    } else {
+      out.println("ANSI Telnet menu is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "status") telnetPrintStatus(out);
   else if (cmd == "monitor" || cmd.startsWith("monitor ")) {
-    out.println("Telnet monitor screen is disabled in v5.74; use status.");
+    if (telnetFullUiAllowed()) telnetStartMonitor(out, parseMonitorRefreshMs(cmd));
+    else out.println("Telnet monitor screen is disabled in BT Telnet mode; use status.");
   }
   else if (cmd == "gpio_startup" || cmd == "gpiostartup" || cmd == "startup_pins") {
     out.print(gpioStartupModeText());
@@ -4738,18 +3102,36 @@ void telnetRunCommand(String line, Print &out) {
     printConsoleHealth(out);
   }
   else if (cmd == "tasks" || cmd.startsWith("tasks ")) {
-    out.println("Telnet FreeRTOS task screen is disabled in v5.74.");
+    if (telnetFullUiAllowed()) telnetStartTasks(out, parseIntervalArgumentMs(cmd, "tasks", 5000UL));
+    else out.println("Telnet FreeRTOS task screen is disabled in BT Telnet mode.");
   }
   else if (cmd == "telnetlog") {
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      out.printf("Telnet live logs: %s lines=%lu\n",
+                 telnetLiveLogEnabled ? "enabled" : "disabled",
+                 (unsigned long)telnetLiveLogLines);
+      out.println("Commands: telnetlog 0 | telnetlog 1");
+    } else {
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnetlog 0") {
-    telnetLiveLogEnabled = false;
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logs disabled.");
+    } else {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnetlog 1") {
-    telnetLiveLogEnabled = false;
-    out.println("Telnet live logging is disabled in v5.74.");
+    if (telnetFullUiAllowed()) {
+      telnetLiveLogEnabled = true;
+      out.println("Telnet live logs enabled.");
+    } else {
+      telnetLiveLogEnabled = false;
+      out.println("Telnet live logging is disabled in BT Telnet mode.");
+    }
   }
   else if (cmd == "telnet" || cmd == "telnet status") {
     printTelnetRuntimeStatus(out);
@@ -4939,17 +3321,17 @@ void telnetRunCommand(String line, Print &out) {
     out.println("Saved full WiFi web mode; restarting soon.");
   }
   else if (cmd == "telnetlog") {
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "telnetlog 0") {
     telnetLiveLogEnabled = false;
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "telnetlog 1") {
     telnetLiveLogEnabled = false;
-    Serial.println("Telnet live logging is disabled in v5.74.");
+    Serial.println("Telnet live logging is disabled in BT Telnet mode.");
   }
 
   else if (cmd == "reboot" || cmd == "restart") {
@@ -5007,469 +3389,6 @@ void telnetExecuteCommand(String line, Print &out) {
 
   telnetRunCommand(line, out);
 }
-
-void handleConsole() {
-  if (!Serial.available()) return;
-
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  String cmd = line;
-  cmd.toLowerCase();
-
-  Serial.print("[console] command echo: ");
-  Serial.println(line);
-
-  if (serialPendingConfirmCommand.length()) {
-    if (consoleConfirmYes(cmd)) {
-      line = serialPendingConfirmCommand;
-      cmd = line;
-      cmd.toLowerCase();
-      serialPendingConfirmCommand = "";
-      serialPendingConfirmDescription = "";
-      Serial.println("Confirmed.");
-    } else if (consoleConfirmNo(cmd)) {
-      serialPendingConfirmCommand = "";
-      serialPendingConfirmDescription = "";
-      Serial.println("Cancelled.");
-      return;
-    } else {
-      Serial.print("Pending confirmation for '");
-      Serial.print(serialPendingConfirmCommand);
-      Serial.println("'. Enter y or n.");
-      return;
-    }
-  } else {
-    String description;
-    if (commandRequiresDisconnectConfirm(cmd, false, description)) {
-      serialPendingConfirmCommand = line;
-      serialPendingConfirmDescription = description;
-      printCommandConfirmPrompt(Serial, line, description);
-      return;
-    }
-  }
-
-  if (cmd == "help" || cmd == "?") printHelp();
-  else if (cmd.startsWith("help ")) printHelpTopic(line.substring(5));
-  else if (cmd == "status") printConsoleStatus();
-
-  else if (cmd == "gpio_startup" || cmd == "gpiostartup" || cmd == "startup_pins") {
-    Serial.print(gpioStartupModeText());
-  }
-
-  else if (cmd == "current_state" || cmd == "currentstate" || cmd == "state") {
-    Serial.println();
-    Serial.println("=== Current State ===");
-    Serial.print(currentStateText());
-    Serial.println("=== End Current State ===");
-  }
-
-  else if (cmd == "system_health" || cmd == "systemhealth" || cmd == "health") {
-    Serial.println();
-    printConsoleHealth(Serial);
-  }
-
-  else if (cmd == "tasks") {
-    printTaskRuntimeStats(Serial);
-  }
-
-  else if (cmd == "reboot" || cmd == "restart") {
-    if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB)
-      Serial.println("BT mode will restart with Telnet only; no web interface.");
-    Serial.println("Reboot command received; restarting ESP32...");
-    delay(150);
-    ESP.restart();
-  }
-
-  else if (cmd == "web" || cmd == "web status" || cmd == "webserver" || cmd == "webserver status" ||
-           cmd == "web on" || cmd == "webserver on" || cmd == "web off" || cmd == "webserver off" ||
-           cmd == "web toggle" || cmd == "webserver toggle") {
-    if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB)
-      Serial.println("BT mode is Telnet-only; no web server is available.");
-    else
-      Serial.println("Full WiFi web interface is active and controlled by the saved boot mode.");
-  }
-
-  else if (cmd == "wifi" || cmd == "wifi status") {
-    Serial.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
-    Serial.printf("Web interface: %s\n", bridgeMode == BRIDGE_MODE_BT_MIN_WEB ? "disabled (BT Telnet-only)" : "Full WiFi web active");
-    Serial.printf("WiFi mode text: %s\n", wifiModeText.c_str());
-    Serial.printf("AP running: %d AP IP: %s STA connected: %d STA IP: %s\n",
-                  apRunning ? 1 : 0,
-                  WiFi.softAPIP().toString().c_str(),
-                  (staConnected && WiFi.status() == WL_CONNECTED) ? 1 : 0,
-                  WiFi.localIP().toString().c_str());
-    Serial.println("Commands: wifi on | wifi off | wifi toggle");
-  }
-
-  else if (cmd == "wifi off") {
-    LOG_WIFI_I("Explicit WiFi runtime off accepted: serial");
-    runtimeWifiOff();
-  }
-
-  else if (cmd == "wifi on") {
-    LOG_WIFI_I("Explicit WiFi runtime on accepted: serial");
-    runtimeWifiOn();
-  }
-
-  else if (cmd == "wifi toggle") {
-    if (wifiRuntimeEnabled) {
-      LOG_WIFI_I("Explicit WiFi runtime off accepted: serial toggle");
-      runtimeWifiOff();
-    } else {
-      LOG_WIFI_I("Explicit WiFi runtime on accepted: serial toggle");
-      runtimeWifiOn();
-    }
-  }
-
-  else if (cmd == "telnet" || cmd == "telnet status") {
-    printTelnetRuntimeStatus(Serial);
-  }
-
-  else if (cmd == "telnet down" || cmd == "telnet off" || cmd == "telnet 0") {
-    Serial.println("Stopping and unloading only the Telnet server; WiFi remains on...");
-    LOG_WIFI_I("Explicit Telnet server down accepted: serial");
-    stopTelnetConsoleServer("serial telnet command");
-  }
-
-  else if (cmd == "telnet on" || cmd == "telnet 1") {
-    LOG_WIFI_I("Explicit Telnet server on accepted: serial");
-    if (!wifiRuntimeEnabled) {
-      Serial.println("Telnet cannot start because WiFi is off. Use 'wifi on' first.");
-    } else if (!telnetConsoleServerRunning()) {
-      startTelnetConsoleServer("serial telnet command");
-    }
-    Serial.println(telnetConsoleServerRunning() ? "Telnet server is ON; WiFi was unchanged." : "Telnet start failed.");
-    printTelnetRuntimeStatus(Serial);
-  }
-
-  else if (cmd == "modebt" || cmd == "modebt_telnet" || cmd == "modebt_noweb" || cmd == "modebt_telnetonly") {
-    saveBluetoothLiteWebBootEnabled(false);
-    saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
-    scheduleRestart("serial modebt telnet-only");
-    Serial.println("Saved BT Telnet-only mode; restarting. No web interface will start in BT mode.");
-  }
-
-  else if (cmd == "modewifi") {
-    saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
-    scheduleRestart("serial modewifi");
-    Serial.println("Saved full WiFi web mode; restarting...");
-  }
-
-  else if (cmd == "apdefault") {
-    apSsid = "NexStar_Bridge";
-    apPass = "12345678";
-    apIp = "192.168.4.1";
-    staRuntimeDisabled = true;
-    bool ok = savePersistentSettings();
-    scheduleApRestart("serial apdefault");
-    Serial.printf("AP defaults saved=%d; soft AP restarting as %s / %s / %s\n",
-                  ok ? 1 : 0, runtimeApSsid().c_str(), apPass.c_str(), apIp.c_str());
-  }
-
-  else if (cmd.startsWith("setsta ")) {
-    String rest = line.substring(7);
-    rest.trim();
-    int sp = rest.indexOf(' ');
-    if (sp <= 0) {
-      Serial.println("Usage: setsta <ssid> <password>");
-    } else {
-      String ssid = rest.substring(0, sp);
-      String pass = rest.substring(sp + 1);
-      ssid.trim();
-      pass.trim();
-      staRuntimeDisabled = false;
-      bool saved = saveWiFiConfig(ssid, pass);
-      bool connected = false;
-      if (saved) {
-        WiFi.mode(WIFI_STA);
-        startFallbackAP();
-        connected = connectConfiguredSTA();
-      }
-      Serial.printf("STA save=%d connected=%d ssid=%s ip=%s status=%s\n",
-                    saved ? 1 : 0, connected ? 1 : 0, staSsid.c_str(),
-                    WiFi.localIP().toString().c_str(), lastWifiStatus.c_str());
-    }
-  }
-
-  else if (cmd == "log") {
-    Serial.println("[console] log command accepted: current status");
-    printConsoleLogStatus();
-  }
-
-  else if (cmd.startsWith("log ")) {
-    String args = line.substring(4);
-    args.trim();
-
-    int sp = args.indexOf(' ');
-    String lvlText = (sp >= 0) ? args.substring(0, sp) : args;
-    lvlText.trim();
-
-    int lvl = lvlText.toInt();
-    if (lvl < 0) lvl = 0;
-    if (lvl > 5) lvl = 5;
-    LOG_LEVEL = lvl;
-
-    Serial.printf("[console] log level applied: %d (%s)\n", LOG_LEVEL, logLevelName(LOG_LEVEL));
-
-    if (sp >= 0) {
-      String cats = args.substring(sp + 1);
-      cats.trim();
-      if (cats.length() > 0) {
-        uint16_t mask = consoleLogMaskFromList(cats);
-        LOG_SUBSYSTEM_MASK = mask;
-
-        Serial.print("[console] log systems applied: ");
-        Serial.println(cats);
-        Serial.printf("[console] log system mask now: 0x%04X\n", LOG_SUBSYSTEM_MASK);
-        Serial.print("[console] enabled systems now: ");
-        Serial.println(consoleLogMaskNames(LOG_SUBSYSTEM_MASK));
-      }
-    }
-
-    String msg = "[info][system] Serial console log command applied: level=";
-    msg += logLevelName(LOG_LEVEL);
-    msg += " mask=0x";
-    msg += String(LOG_SUBSYSTEM_MASK, HEX);
-    msg += " enabled=";
-    msg += consoleLogMaskNames(LOG_SUBSYSTEM_MASK);
-    msg += " command='";
-    msg += line;
-    msg += "'";
-    addLogLine(msg);
-  }
-
-  else if (cmd == "testinit") {
-    bool ok = testInit();
-    Serial.printf("testinit result: %s\n", ok ? "OK" : "FAILED");
-  }
-
-  else if (cmd == "get") {
-    double ra = 0.0;
-    double dec = 0.0;
-    bool ok = getRaDec(ra, dec, true);
-    Serial.printf("get result: %s\n", ok ? "OK" : "FAILED");
-  }
-
-  else if (cmd == "getaltaz") {
-    double alt = 0.0;
-    double az = 0.0;
-    bool ok = getAltAz(alt, az, true);
-    Serial.printf("getaltaz result: %s\n", ok ? "OK" : "FAILED");
-  }
-
-  else if (cmd == "rates") {
-    Serial.printf("Nudge rates: %.3f %.3f %.3f %.3f poll=%lu idlePoll=%lu effectivePoll=%lu demand=%s throttle=%lu\n",
-                  nudgeRateDeg[0], nudgeRateDeg[1], nudgeRateDeg[2], nudgeRateDeg[3],
-                  pollIntervalMs, idlePollIntervalMs, effectiveMountPollIntervalMs(),
-                  positionDemandActive() ? "active" : "idle", minClientPollIntervalMs);
-  }
-
-  else if (cmd == "mountpoll") {
-    printMountPollValue(Serial);
-  }
-
-  else if (cmd.startsWith("mountpoll ")) {
-    long p = line.substring(10).toInt();
-    bool ok = setMountPollValue(p);
-    Serial.printf("mountpoll set to %lu ms%s\n", pollIntervalMs, ok ? "" : " (save failed)");
-  }
-
-  else if (cmd == "idlepoll" || cmd == "poll idle") {
-    Serial.printf("Idle poll interval: %lu ms\n", idlePollIntervalMs);
-    Serial.printf("Effective poll interval: %lu ms (%s)\n",
-                  effectiveMountPollIntervalMs(),
-                  positionDemandActive() ? "active demand" : "idle");
-  }
-
-  else if (cmd.startsWith("idlepoll ") || cmd.startsWith("poll idle ")) {
-    String arg = cmd.startsWith("idlepoll ") ? line.substring(9) : line.substring(10);
-    arg.trim();
-    long p = arg.toInt();
-    if (p < 0) p = 0;
-    if (p > 60000) p = 60000;
-    idlePollIntervalMs = (unsigned long)p;
-    resetMountPollScheduler();
-    bool ok = savePersistentSettings();
-    Serial.printf("Idle poll interval set to %lu ms saved=%d\n", idlePollIntervalMs, ok ? 1 : 0);
-  }
-
-  else if (cmd == "nudge az+") Serial.printf("nudge az+ result: %s\n", nudgeRelativeAltAz(0.0, nudgeRateDeg[1]) ? "OK" : "FAILED");
-  else if (cmd == "nudge az-") Serial.printf("nudge az- result: %s\n", nudgeRelativeAltAz(0.0, -nudgeRateDeg[1]) ? "OK" : "FAILED");
-  else if (cmd == "nudge alt+") Serial.printf("nudge alt+ result: %s\n", nudgeRelativeAltAz(nudgeRateDeg[1], 0.0) ? "OK" : "FAILED");
-  else if (cmd == "nudge alt-") Serial.printf("nudge alt- result: %s\n", nudgeRelativeAltAz(-nudgeRateDeg[1], 0.0) ? "OK" : "FAILED");
-  else if (cmd == "drain") drainMount();
-  else if (cmd == "pos") Serial.println(currentStateText());
-  else { Serial.print("Unknown command: "); Serial.println(line); Serial.println("Type help."); }
-}
-
-
-#if defined(ESP32)
-String httpsAutoDeviceTimeLocationScript() {
-  String js;
-  js.reserve(2600);
-  String ret = cleanGpsReturnUrl(gpsSyncReturnUrl);
-  ret.replace("\\", "\\\\");
-  ret.replace("'", "\\'");
-  js += "<script>";
-  js += "function nxEnc(v){return encodeURIComponent(v)};";
-  js += "function nxReturnUrl(){try{let p=new URLSearchParams(location.search);return p.get('return')||'";
-  js += ret;
-  js += "'}catch(e){return '";
-  js += ret;
-  js += "'}};";
-  js += "function nxMsg(s){let m=document.getElementById('httpsMsg');if(m)m.textContent=s};";
-  js += "function nxSendDeviceSite(lat,lon,acc){let d=new Date();let off=-d.getTimezoneOffset();";
-  js += "let ret=nxReturnUrl();";
-  js += "let u='/set_device_site_time?year='+d.getFullYear()+'&month='+(d.getMonth()+1)+'&day='+d.getDate()+'&hour='+d.getHours()+'&minute='+d.getMinutes()+'&second='+d.getSeconds()+'&offset='+off+'&return='+nxEnc(ret);";
-  js += "if(lat!==null&&lon!==null){u+='&lat='+nxEnc(lat)+'&lon='+nxEnc(lon);if(acc!==null)u+='&elev=0'}";
-  js += "fetch(u,{cache:'no-store'}).then(r=>r.text()).then(()=>{nxMsg(lat!==null?'Browser time/date/location saved. Returning to main page in 5 seconds...':'Browser time/date saved; location was not provided. Returning to main page in 5 seconds...');setTimeout(()=>{let sep=ret.includes('?')?'&':'?';location.replace(ret+sep+'gpssync_return='+Date.now())},5000)}).catch(e=>{nxMsg('GPS Sync save failed: '+e)});}";
-  js += "function nxTryBrowserSiteTime(){nxMsg('Requesting browser location/time...');";
-  js += "if(navigator.geolocation){navigator.geolocation.getCurrentPosition(p=>nxSendDeviceSite(p.coords.latitude,p.coords.longitude,p.coords.accuracy),e=>nxSendDeviceSite(null,null,null),{enableHighAccuracy:true,timeout:10000,maximumAge:300000});}";
-  js += "else{nxSendDeviceSite(null,null,null)}};";
-  js += "window.addEventListener('load',()=>setTimeout(nxTryBrowserSiteTime,800));";
-  js += "</script>";
-  return js;
-}
-
-String buildHttpsMainPage() {
-  String page;
-  page.reserve(3200);
-  String ret = cleanGpsReturnUrl(gpsSyncReturnUrl);
-  ret.replace("\\", "\\\\");
-  ret.replace("'", "&#39;");
-  page += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  page += "<meta http-equiv='Cache-Control' content='no-store'>";
-  page += "<title>NexStar GPS Sync</title></head><body style='font-family:Arial,sans-serif;background:#111;color:#eee;margin:18px'>";
-  page += "<h2>NexStar GPS Sync</h2>";
-  page += "<div id='httpsMsg' style='padding:10px;margin:10px 0;border:1px solid #555;background:#222;border-radius:8px'>Preparing GPS Sync...</div>";
-  page += "<p>This HTTPS page lets the browser provide location permission. Browser time/date is also copied to the ESP32.</p>";
-  page += "<p>Return target: <span style='color:#8cf'>";
-  page += ret;
-  page += "</span></p>";
-  page += "<p><a style='display:inline-block;padding:10px 14px;background:#2d6cdf;color:#fff;text-decoration:none;border-radius:6px' href='";
-  page += cleanGpsReturnUrl(gpsSyncReturnUrl);
-  page += "'>Return without syncing</a></p>";
-  page += "<p><a style='color:#8cf' href='/timeloc_status'>Time/Location Status</a> | <a style='color:#8cf' href='/status'>HTTPS Status</a></p>";
-  page += httpsAutoDeviceTimeLocationScript();
-  page += "</body></html>";
-  return page;
-}
-
-void httpsSendText(httpd_req_t *req, const char *type, const String &body) {
-  httpd_resp_set_type(req, type);
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  httpd_resp_send(req, body.c_str(), body.length());
-}
-
-String jsonBool(bool v) {
-  return v ? "true" : "false";
-}
-
-esp_err_t httpsCatchAllHandler(httpd_req_t *req) {
-  String uri = String(req->uri);
-  String ret = httpParamValue(uri, "return");
-  if (ret.length() && ret.startsWith("http://")) {
-    gpsSyncReturnUrl = cleanGpsReturnUrl(ret);
-  }
-
-  String path = uri;
-  int q = path.indexOf('?');
-  if (q >= 0) path = path.substring(0, q);
-
-  if (path == "/" || path == "/index.html" || path == "/gps_sync") {
-    httpsSendText(req, "text/html", buildHttpsMainPage());
-    return ESP_OK;
-  }
-
-  if (path == "/set_device_site_time") {
-    bool gotLocation = false;
-    applyHttpsBrowserTimeLocationFromUrl(uri, gotLocation);
-    scheduleHttpsSetupStop(1800);
-    ret = httpParamValue(uri, "return");
-    if (ret.length() && ret.startsWith("http://")) gpsSyncReturnUrl = cleanGpsReturnUrl(ret);
-    httpsSendText(req, "text/plain", gotLocation ? "HTTPS browser time/location saved" : "HTTPS browser time saved; location not provided");
-    return ESP_OK;
-  }
-
-  if (path == "/timeloc_status") {
-    String s;
-    s.reserve(1200);
-    s += "Time / Location status " + String(FW_VERSION) + "\n";
-    s += "Time valid: " + String(timeValid ? "true" : "false") + "\n";
-    s += "Time source: " + String(timeSourceName(currentTimeSource)) + "\n";
-    s += "UTC offset minutes: " + String(utcOffsetMinutes) + "\n";
-    s += "UTC offset source: " + utcOffsetSource + "\n";
-    s += "Local date: " + String(localYear) + "-" + String(localMonth) + "-" + String(localDay) + "\n";
-    s += "Local time: " + String(localHour) + ":" + String(localMinute) + ":" + String(localSecond) + "\n";
-    s += "Site valid: " + String(siteValid ? "true" : "false") + "\n";
-    s += "Location source: " + currentLocationSource + "\n";
-    s += "Latitude: " + String(siteLatitudeDeg, 6) + "\n";
-    s += "Longitude: " + String(siteLongitudeDeg, 6) + "\n";
-    httpsSendText(req, "text/plain", s);
-    return ESP_OK;
-  }
-
-  if (path == "/status") {
-    String body = "{\"ok\":true,\"https\":true,\"timeValid\":" + jsonBool(timeValid) +
-                  ",\"siteValid\":" + jsonBool(siteValid) +
-                  ",\"apIP\":\"" + WiFi.softAPIP().toString() + "\"" +
-                  ",\"staIP\":\"" + WiFi.localIP().toString() + "\"}";
-    httpsSendText(req, "application/json", body);
-    return ESP_OK;
-  }
-
-  if (path == "/mount_test") {
-    String s = "Mount test is available on the normal HTTP web UI.\n";
-    httpsSendText(req, "text/plain", s);
-    return ESP_OK;
-  }
-
-  httpsSendText(req, "text/plain", "HTTPS GPS Sync route not implemented in " + String(FW_VERSION) + ": " + uri);
-  return ESP_OK;
-}
-
-void startHttpsSetupServer() {
-  if (httpsSetupServerHandle) return;
-
-  httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
-  conf.port_secure = HTTPS_SETUP_PORT;
-  conf.servercert = (const unsigned char *)HTTPS_SETUP_CERT;
-  conf.servercert_len = strlen(HTTPS_SETUP_CERT) + 1;
-  conf.prvtkey_pem = (const unsigned char *)HTTPS_SETUP_KEY;
-  conf.prvtkey_len = strlen(HTTPS_SETUP_KEY) + 1;
-  conf.httpd.uri_match_fn = httpd_uri_match_wildcard;
-
-  esp_err_t ret = httpd_ssl_start(&httpsSetupServerHandle, &conf);
-  if (ret != ESP_OK) {
-    Serial.printf("HTTPS web UI server failed to start: err=%d\n", (int)ret);
-    httpsSetupServerHandle = NULL;
-    return;
-  }
-
-  httpd_uri_t root_uri = {};
-  root_uri.uri = "/";
-  root_uri.method = HTTP_GET;
-  root_uri.handler = httpsCatchAllHandler;
-  root_uri.user_ctx = NULL;
-  httpd_register_uri_handler(httpsSetupServerHandle, &root_uri);
-
-  httpd_uri_t set_uri = {};
-  set_uri.uri = "/set_device_site_time*";
-  set_uri.method = HTTP_GET;
-  set_uri.handler = httpsCatchAllHandler;
-  set_uri.user_ctx = NULL;
-  httpd_register_uri_handler(httpsSetupServerHandle, &set_uri);
-
-  httpd_uri_t any_uri = {};
-  any_uri.uri = "/*";
-  any_uri.method = HTTP_GET;
-  any_uri.handler = httpsCatchAllHandler;
-  any_uri.user_ctx = NULL;
-  httpd_register_uri_handler(httpsSetupServerHandle, &any_uri);
-
-  Serial.printf("HTTPS web UI ready: https://%s/\n", WiFi.softAPIP().toString().c_str());
-}
-#endif
 
 void handleModeRedirectHome() {
   webServer->sendHeader("Location", "/");
@@ -5560,7 +3479,7 @@ void handleFullWifiRebootPage() {
 
 void setup() {
   Serial.begin(115200);
-  
+
   LOGI("Serial log mirror enabled: Full WiFi log format [level][system]");
 delay(500);
 
@@ -5761,7 +3680,7 @@ delay(500);
 
 #if defined(ESP32)
   if (bridgeMode == BRIDGE_MODE_WIFI_FULL) {
-    if (HTTPS_WEB_AUTO_START) {
+    if (httpsWebAutoStartEnabled()) {
       startHttpsSetupServer();
     } else {
       Serial.printf("HTTPS GPS Sync auto-start disabled; HTTP UI is active on port %u. Use GPS Sync button to start HTTPS on demand.\n", HTTP_WEB_PORT);

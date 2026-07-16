@@ -1,4 +1,5 @@
 #include "logging.h"
+#include "settings.h"
 #include <stdarg.h>
 #if defined(ESP32)
   #include <WiFi.h>
@@ -90,8 +91,17 @@ void addLogLine(const String &line) {
   }
 #endif
 
-  // Telnet live logging is intentionally disabled in v5.74 while isolating
-  // Telnet stability; serial logging remains unchanged.
+#if defined(ESP32)
+  // BT Telnet mode remains a plain command console; full WiFi mode keeps the
+  // live Telnet log stream.
+  if (bridgeMode == BRIDGE_MODE_WIFI_FULL &&
+      telnetLiveLogEnabled && telnetAuthenticated && telnetClient && telnetClient.connected()) {
+    telnetClient.print("\r\n");
+    telnetClient.print(stamped);
+    telnetClient.print("\r\n> ");
+    telnetLiveLogLines++;
+  }
+#endif
 }
 
 void logPrintfCat(int level, uint16_t cat, const char* fmt, ...) {

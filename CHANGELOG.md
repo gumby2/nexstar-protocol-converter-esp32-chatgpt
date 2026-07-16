@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.86
+
+- Completed the v5.77-v5.81 modular refactor series for slew web handlers, console commands, task diagnostics, HTTPS setup server, and remaining main-program cleanup.
+- Restored full Telnet menu/status behavior in Wi-Fi mode while preserving plain-command Telnet behavior in BT mode.
+- Aligned web and Telnet status views, improved Telnet status scrolling/refresh behavior, and identified v5.86 as the current hardware-tested working baseline.
+
 ## v5.76
 
 - Refactored remaining time/NTP, time-formatting, UTC/local conversion, observer-time, and location utilities into `time_services.h` and `time_services.cpp`.
