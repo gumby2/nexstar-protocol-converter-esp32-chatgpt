@@ -49,7 +49,7 @@ const bool ESP32_BOOT_AP_ONLY = false;
 const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
 const bool ESP32_BOOT_WEB_ONLY = false;
 
-const char* FW_VERSION = "v5.86";
+const char* FW_VERSION = "v5.87";
 const char* FW_NAME = "NexStar Protocol Converter";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
@@ -2743,6 +2743,7 @@ void telnetPrintHelp(Print &out) {
   out.println("  apdefault");
   out.println("  setsta <ssid> <password>");
   out.println("  log | log 0..5 [systems]");
+  out.println("  red");
   if (telnetFullUiAllowed()) {
     out.println("Full Telnet UI: menu | monitor [s|ms] | tasks [s|ms] | telnetlog [0|1]");
   } else {
@@ -3032,6 +3033,9 @@ void telnetRunCommand(String line, Print &out) {
       } else {
         out.println("  Telnet live logging is disabled in BT Telnet mode.");
       }
+    } else if (topic == "red" || topic == "color" || topic == "colour") {
+      out.println("red");
+      out.println("  Toggle this Telnet session between normal text and red text.");
     } else if (topic == "idlepoll") {
       out.println("idlepoll | poll idle");
       out.println("  Show idle poll interval and effective poll interval.");
@@ -3047,7 +3051,7 @@ void telnetRunCommand(String line, Print &out) {
       out.print("Unknown help topic: "); out.println(topic);
       out.println("Grouped topics: mount, mode, wifi");
       out.println("Specific topics: log, web, reboot, testinit, get, getaltaz, rates,");
-      out.println("mountpoll, nudge, idlepoll, drain, pos, health, gpio, telnet,");
+      out.println("mountpoll, nudge, idlepoll, drain, pos, health, gpio, telnet, red,");
       out.println("setsta, apdefault");
     }
   }
@@ -3132,6 +3136,11 @@ void telnetRunCommand(String line, Print &out) {
       telnetLiveLogEnabled = false;
       out.println("Telnet live logging is disabled in BT Telnet mode.");
     }
+  }
+  else if (cmd == "red") {
+    telnetRedTextEnabled = !telnetRedTextEnabled;
+    telnetApplyTextColor(out);
+    out.println(telnetRedTextEnabled ? "Telnet text color: red." : "Telnet text color: normal.");
   }
   else if (cmd == "telnet" || cmd == "telnet status") {
     printTelnetRuntimeStatus(out);
