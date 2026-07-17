@@ -52,6 +52,7 @@ uint32_t telnetRxCommands = 0;
 uint32_t telnetAuthFailures = 0;
 bool telnetLiveLogEnabled = false;
 uint32_t telnetLiveLogLines = 0;
+bool telnetRedTextEnabled = false;
 String telnetPendingConfirmCommand = "";
 String telnetPendingConfirmDescription = "";
 bool telnetMonitorActive = false;
@@ -1053,7 +1054,8 @@ static void vtHideCursor(Print &out) { if (!telnetMenuWindowsCompat) out.print("
 static void vtShowCursor(Print &out) { if (!telnetMenuWindowsCompat) out.print("\x1B[?25h\x1B[?12h"); } // DEC private cursor modes; disabled for Windows telnet.exe
 static void vtAltOn(Print &out) { if (!telnetMenuWindowsCompat) out.print("\x1B[?47h\x1B[?1049h"); } // alternate screen; disabled for Windows telnet.exe
 static void vtAltOff(Print &out) { if (!telnetMenuWindowsCompat) out.print("\x1B[?1049l\x1B[?47l"); } // leave alternate screen; disabled for Windows telnet.exe
-static void vtReset(Print &out) { out.print("\x1B[0m"); } // SGR reset
+void telnetApplyTextColor(Print &out) { out.print(telnetRedTextEnabled ? "\x1B[31m" : "\x1B[0m"); }
+static void vtReset(Print &out) { out.print("\x1B[0m"); if (telnetRedTextEnabled) out.print("\x1B[31m"); } // SGR reset
 static void vtSelected(Print &out) { out.print("\x1B[7m"); } // SGR reverse only: safest Windows telnet.exe highlight
 static void vtDim(Print &out) { if (!telnetMenuWindowsCompat) out.print("\x1B[2m"); } // SGR dim; omitted for Windows telnet.exe
 static void vtTitle(Print &out) { if (!telnetMenuWindowsCompat) out.print("\x1B[1;96m"); else out.print("\x1B[1m"); } // basic bold in Windows compatibility mode
@@ -1958,6 +1960,7 @@ void stopTelnetConsoleServer(const char* reason) {
   telnetAuthenticated = false;
   telnetLine = "";
   telnetLastWasCR = false;
+  telnetRedTextEnabled = false;
   telnetPendingConfirmCommand = "";
   telnetPendingConfirmDescription = "";
 
@@ -2019,6 +2022,7 @@ void serviceTelnetConsole() {
       telnetAuthenticated = (telnetPassword.length() == 0);
       telnetLine = "";
       telnetLastWasCR = false;
+      telnetRedTextEnabled = false;
       telnetMonitorActive = false;
       telnetTasksActive = false;
       telnetMenuActive = false;
@@ -2026,6 +2030,7 @@ void serviceTelnetConsole() {
       TelnetCRLFPrint telnetOut(telnetClient);
       telnetIacState = 0; telnetTermWidth = 80; telnetTermHeight = 24; telnetNawsReceived = false;
       { const uint8_t nego[] = {255,251,1,255,251,3,255,253,3,255,253,31,255,254,34}; telnetClient.write(nego,sizeof(nego)); }
+      telnetApplyTextColor(telnetOut);
       telnetOut.println();
       if (telnetAuthenticated) {
         telnetOut.println("Type help.");
