@@ -4,7 +4,7 @@ ESP32 firmware for bridging telescope-control clients to an original Celestron N
 
 ## Tested Baseline
 
-v5.86 is the tested working baseline.
+v5.87 is the tested working baseline.
 
 ## Target
 
@@ -24,11 +24,11 @@ arduino-cli core install esp32:esp32@3.3.10
 Compile:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.76
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.87
 ```
 
 Upload:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.76
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.87
 ```

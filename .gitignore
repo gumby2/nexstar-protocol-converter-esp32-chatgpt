@@ -1,12 +1,41 @@
+# Arduino / local build output
 .build/
+.codex-build/
+build/
 dist/
+out/
+firmware/*/build/
+firmware/*/.build/
 *.bin
 *.elf
 *.map
 *.hex
 *.eep
-*.zip
-arduino-cli
+*.uf2
+*.partitions.bin
+*.bootloader.bin
 *.tar.gz
+*.zip
 
-firmware/*/build/
+# IDE and editor metadata
+.arduinoIDE/
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+*~
+
+# Local tools and caches
+arduino-cli
+arduino-cli.exe
+__pycache__/
+.pytest_cache/
+
+# Local credentials and environment overrides
+.env
+.env.*
+*.local
+secrets/
+credentials/

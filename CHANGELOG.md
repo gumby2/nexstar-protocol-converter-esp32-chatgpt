@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.87
+
+- Added the hardware-tested Telnet `red` command to toggle a Telnet session between normal and red ANSI text.
+- Identified v5.87 as the current tested working baseline.
+- Removed obsolete duplicate source copies from the working tree without rewriting Git history.
+
 ## v5.86
 
 - Completed the v5.77-v5.81 modular refactor series for slew web handlers, console commands, task diagnostics, HTTPS setup server, and remaining main-program cleanup.
